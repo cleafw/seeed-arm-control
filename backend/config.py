@@ -31,7 +31,8 @@ class Config:
     # --- hardware ---
     master_port: str | None
     slave_port: str | None
-    baudrate: int
+    baudrate: int               # slave DM_CAN baud
+    master_baudrate: int        # leader Fashionstar UART (StarAi Violin = 1000000)
     update_rate_hz: int
     gripper_exist: bool
     mock: bool                  # synthesize joint data, no real serial I/O
@@ -67,6 +68,8 @@ class Config:
             master_port=os.environ.get("MASTER_PORT") or None,
             slave_port=os.environ.get("SLAVE_PORT") or None,
             baudrate=_env_int("REBOT_BAUDRATE", 921600),
+            # StarAi Violin / StarArm 102 official baud is 1000000 (not 115200).
+            master_baudrate=_env_int("MASTER_BAUD", 1000000),
             update_rate_hz=_env_int("REBOT_UPDATE_HZ", 30),
             gripper_exist=os.environ.get("REBOT_GRIPPER", "1") not in ("0", "false", "no"),
             mock=os.environ.get("REBOT_MOCK", "0") not in ("0", "false", "no", ""),

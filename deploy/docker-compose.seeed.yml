@@ -1,0 +1,31 @@
+# Seeed 现场部署（Pi 5 @ 192.168.1.82）
+# 环境变量：/home/seeed/seeed/ENV/rebot-b601-102-record.env
+#
+# 从仓库根目录：
+#   docker compose -f deploy/docker-compose.seeed.yml up -d --build
+
+name: rebot-record
+
+services:
+  rebot-record:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: rebot-record:latest
+    container_name: rebot-record
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "1882:8000"
+    env_file:
+      - /home/seeed/seeed/ENV/rebot-b601-102-record.env
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - /dev:/dev
+      - ../recordings:/app/recordings
+      - ../backend:/app/backend:ro
+    device_cgroup_rules:
+      - "c 188:* rmw"
+      - "c 166:* rmw"
+      - "c 170:* rmw"

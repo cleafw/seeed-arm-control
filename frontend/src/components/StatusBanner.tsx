@@ -8,6 +8,7 @@ interface Props {
   actions: ActionMeta[];
   onPause: () => void;
   onResume: () => void;
+  onFreeMove: () => void;
 }
 
 function fmtClock(s: number): string {
@@ -15,6 +16,44 @@ function fmtClock(s: number): string {
   const m = Math.floor(s / 60);
   const r = Math.floor(s - m * 60);
   return `${m}:${String(r).padStart(2, "0")}`;
+}
+
+/** Toggle: 停止运行 (unlock motors) ↔ 恢复跟随 */
+function RunToggleButton({
+  freeMove,
+  onFreeMove,
+  onResume,
+  disabled,
+}: {
+  freeMove: boolean;
+  onFreeMove: () => void;
+  onResume: () => void;
+  disabled?: boolean;
+}) {
+  if (freeMove) {
+    return (
+      <button
+        type="button"
+        className="estop-btn estop-btn--resume"
+        onClick={onResume}
+        disabled={disabled}
+        title="重新使能电机，缓慢移动到跟随位姿后继续遥操"
+      >
+        ▶ 恢复跟随
+      </button>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className="estop-btn estop-btn--stop-run"
+      onClick={onFreeMove}
+      disabled={disabled}
+      title="停止跟随：解锁所有电机，可自由拖动（无阻尼）"
+    >
+      ■ 停止运行
+    </button>
+  );
 }
 
 function EstopButton({
@@ -35,7 +74,7 @@ function EstopButton({
         className="estop-btn estop-btn--resume"
         onClick={onResume}
         disabled={disabled}
-        title="解除锁定，慢插值回到主臂当前位姿"
+        title="重新使能电机，并缓慢移动到主臂映射位姿后继续跟随"
       >
         ▶ 解除锁定
       </button>
@@ -61,8 +100,13 @@ export function StatusBanner({
   actions,
   onPause,
   onResume,
+  onFreeMove,
 }: Props) {
   const paused = snapshot?.mode === "paused";
+  const freeMove = snapshot?.mode === "free_move";
+  const armsReady = snapshot?.arms?.ready !== false;
+  const armsHint = snapshot?.arms?.hint;
+  const linkDown = snapshot != null && snapshot.arms?.ready === false;
 
   if (!snapshot) {
     return (
@@ -70,7 +114,37 @@ export function StatusBanner({
         <span className="brand">rebot 录制管理</span>
         <span className="status-banner__center">{connected ? "等待状态..." : "离线"}</span>
         <span className="status-banner__action">
-          <EstopButton paused={false} onPause={onPause} onResume={onResume} disabled={!connected} />
+          <RunToggleButton
+            freeMove={false}
+            onFreeMove={onFreeMove}
+            onResume={onResume}
+            disabled={!connected}
+          />
+        </span>
+      </div>
+    );
+  }
+
+  if (linkDown) {
+    const m = snapshot.arms?.master;
+    const s = snapshot.arms?.slave;
+    const mText = m ? `${m.label}·${m.status === "ok" ? "正常" : m.status === "reconnecting" ? "重连中" : m.status === "missing" ? "未接入" : "异常"}` : "主臂·?";
+    const sText = s ? `${s.label}·${s.status === "ok" ? "正常" : s.status === "reconnecting" ? "重连中" : s.status === "missing" ? "未接入" : "异常"}` : "从臂·?";
+    return (
+      <div className="status-banner--idle status-banner--link-down">
+        <span className="brand">rebot 录制管理</span>
+        <span className="status-banner__center">
+          {armsHint || "串口异常，等待机械臂重新接入"}
+          <span className="status-banner__arms-inline">{mText} · {sText}</span>
+        </span>
+        <span className="status-banner__action status-banner__action--pair">
+          <RunToggleButton
+            freeMove={false}
+            onFreeMove={onFreeMove}
+            onResume={onResume}
+            disabled
+          />
+          <EstopButton paused onPause={onPause} onResume={onResume} disabled />
         </span>
       </div>
     );
@@ -81,8 +155,49 @@ export function StatusBanner({
       <div className="status-banner--idle">
         <span className="brand">rebot 录制管理</span>
         <span className="status-banner__center">主臂 → 从臂 跟随中</span>
-        <span className="status-banner__action">
+        <span className="status-banner__action status-banner__action--pair">
+          <RunToggleButton
+            freeMove={false}
+            onFreeMove={onFreeMove}
+            onResume={onResume}
+          />
           <EstopButton paused={false} onPause={onPause} onResume={onResume} />
+        </span>
+      </div>
+    );
+  }
+
+  if (snapshot.mode === "free_move") {
+    return (
+      <div className="status-banner--idle">
+        <span className="brand">rebot 录制管理</span>
+        <span className="status-banner__center">已停止 — 电机已解锁，可自由拖动</span>
+        <span className="status-banner__action">
+          <RunToggleButton
+            freeMove
+            onFreeMove={onFreeMove}
+            onResume={onResume}
+            disabled={!armsReady}
+          />
+        </span>
+      </div>
+    );
+  }
+
+  if (snapshot.mode === "idle") {
+    return (
+      <div className="status-banner--idle">
+        <span className="brand">rebot 录制管理</span>
+        <span className="status-banner__center">
+          {armsHint || "待校准 — 从臂未跟随"}
+        </span>
+        <span className="status-banner__action">
+          <RunToggleButton
+            freeMove={false}
+            onFreeMove={onFreeMove}
+            onResume={onResume}
+            disabled
+          />
         </span>
       </div>
     );
@@ -109,8 +224,16 @@ export function StatusBanner({
   } else if (snapshot.mode === "return_to_follow") {
     detail = `${elapsed.toFixed(1)}s`;
   } else if (snapshot.mode === "paused") {
-    detail = "从臂已锁定，主臂活动不会被传递";
+    detail = armsHint || "从臂已锁定，主臂活动不会被传递";
+  } else if (snapshot.mode === "calibrate") {
+    detail = "从臂已失能，请分别拖动主/从臂扫满各轴行程";
   }
+
+  const showRunToggle =
+    snapshot.mode === "record" ||
+    snapshot.mode === "playback" ||
+    snapshot.mode === "transition" ||
+    snapshot.mode === "return_to_follow";
 
   return (
     <div
@@ -123,8 +246,21 @@ export function StatusBanner({
       />
       <span className="status-banner__label">{style.label}</span>
       {detail ? <span className="status-banner__detail">{detail}</span> : null}
-      <span className="status-banner__action">
-        <EstopButton paused={paused} onPause={onPause} onResume={onResume} />
+      <span className="status-banner__action status-banner__action--pair">
+        {showRunToggle ? (
+          <RunToggleButton
+            freeMove={freeMove}
+            onFreeMove={onFreeMove}
+            onResume={onResume}
+            disabled={!armsReady}
+          />
+        ) : null}
+        <EstopButton
+          paused={paused}
+          onPause={onPause}
+          onResume={onResume}
+          disabled={!armsReady && paused}
+        />
       </span>
     </div>
   );

@@ -1,0 +1,12 @@
+# reBot 主从臂稳定设备名（插拔后仍可用 /dev/rebot-master / /dev/rebot-slave）
+# 安装：sudo cp 99-rebot-arms.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# 主臂 CH340（VID=1a86 PID=7523）
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="rebot-master", MODE="0666", GROUP="dialout"
+
+# 从臂 CH343（常见 ttyCH343USB* / VID=1a86 PID=55d3）
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", SYMLINK+="rebot-slave", MODE="0666", GROUP="dialout"
+
+# 从臂 HDSC USB CDC ACM
+SUBSYSTEM=="tty", ATTRS{manufacturer}=="HDSC", SYMLINK+="rebot-slave", MODE="0666", GROUP="dialout"
+KERNEL=="ttyACM*", ATTRS{product}=="CDC*", SYMLINK+="rebot-slave", MODE="0666", GROUP="dialout"

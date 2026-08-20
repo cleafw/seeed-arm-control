@@ -18,6 +18,7 @@ class Motor:
         self.state_q = float(0)
         self.state_dq = float(0)
         self.state_tau = float(0)
+        self.state_err = 0
         self.SlaveID = SlaveID
         self.MasterID = MasterID
         self.MotorType = MotorType
@@ -25,10 +26,13 @@ class Motor:
         self.NowControlMode = Control_Type.MIT
         self.temp_param_dict = {}
 
-    def recv_data(self, q: float, dq: float, tau: float):
+    def recv_data(self, q: float, dq: float, tau: float, err: int = 0):
         self.state_q = q
         self.state_dq = dq
         self.state_tau = tau
+        self.state_err = int(err) & 0xF
+        # Generation counter: lets callers detect whether refresh got a CAN reply.
+        self._rx_gen = getattr(self, "_rx_gen", 0) + 1
 
     def getPosition(self):
         """
@@ -331,6 +335,7 @@ class MotorControl:
         if CMD == 0x11:
             if CANID != 0x00:
                 if CANID in self.motors_map:
+                    err = int((data[0] >> 4) & 0x0F)
                     q_uint = np.uint16((np.uint16(data[1]) << 8) | data[2])
                     dq_uint = np.uint16((np.uint16(data[3]) << 4) | (data[4] >> 4))
                     tau_uint = np.uint16(((data[4] & 0xf) << 8) | data[5])
@@ -341,9 +346,10 @@ class MotorControl:
                     recv_q = uint_to_float(q_uint, -Q_MAX, Q_MAX, 16)
                     recv_dq = uint_to_float(dq_uint, -DQ_MAX, DQ_MAX, 12)
                     recv_tau = uint_to_float(tau_uint, -TAU_MAX, TAU_MAX, 12)
-                    self.motors_map[CANID].recv_data(recv_q, recv_dq, recv_tau)
+                    self.motors_map[CANID].recv_data(recv_q, recv_dq, recv_tau, err)
             else:
                 MasterID=data[0] & 0x0f
+                err = int((data[0] >> 4) & 0x0F)
                 if MasterID in self.motors_map:
                     q_uint = np.uint16((np.uint16(data[1]) << 8) | data[2])
                     dq_uint = np.uint16((np.uint16(data[3]) << 4) | (data[4] >> 4))
@@ -355,7 +361,7 @@ class MotorControl:
                     recv_q = uint_to_float(q_uint, -Q_MAX, Q_MAX, 16)
                     recv_dq = uint_to_float(dq_uint, -DQ_MAX, DQ_MAX, 12)
                     recv_tau = uint_to_float(tau_uint, -TAU_MAX, TAU_MAX, 12)
-                    self.motors_map[MasterID].recv_data(recv_q, recv_dq, recv_tau)
+                    self.motors_map[MasterID].recv_data(recv_q, recv_dq, recv_tau, err)
 
     def __process_set_param_packet(self, data, CANID, CMD):
         if CMD == 0x11 and (data[2] == 0x33 or data[2] == 0x55):
@@ -438,16 +444,21 @@ class MotorControl:
         max_retries = 10
         retry_interval = 0.05  #retry times
         RID = 10
-        self.__write_motor_param(Motor, RID, np.uint8(ControlMode))
+        want = int(ControlMode)
+        self.__write_motor_param(Motor, RID, want)
         for _ in range(max_retries):
             sleep(retry_interval)
             self.recv_set_param_data()
             if Motor.SlaveID in self.motors_map:
                 if RID in self.motors_map[Motor.SlaveID].temp_param_dict:
-                    if self.motors_map[Motor.SlaveID].temp_param_dict[RID] == ControlMode:
-                        return True
-                    else:
-                        return False
+                    got = self.motors_map[Motor.SlaveID].temp_param_dict[RID]
+                    try:
+                        if int(float(got)) == want:
+                            return True
+                    except (TypeError, ValueError):
+                        pass
+                    # Mismatch: rewrite and keep trying (do not abort early).
+                    self.__write_motor_param(Motor, RID, want)
         return False
 
     def save_motor_param(self, Motor):

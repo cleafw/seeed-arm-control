@@ -1,11 +1,11 @@
 [project]
 name = "rebot-record"
 version = "0.2.0"
-description = "rebot B601-DM master + SO102 slave teleop / record / playback service"
+description = "StarAi Violin / Arm-102 leader + reBot B601-DM follower teleop / record / playback"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "fashionstar-uart-sdk>=1.3.8",
+    "motorbridge-smart-servo>=0.0.4",
     "numpy>=2.0",
     "pyserial>=3.5",
     "fastapi>=0.115",

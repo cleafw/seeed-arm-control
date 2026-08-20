@@ -2,14 +2,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
 
 PlayMode = Literal["loop", "once"]
 ControllerMode = Literal[
-    "follow", "record", "transition", "playback", "return_to_follow", "paused"
+    "idle",
+    "follow",
+    "record",
+    "transition",
+    "playback",
+    "return_to_follow",
+    "paused",
+    "calibrate",
+    "free_move",
 ]
 
 
@@ -67,6 +75,21 @@ class ActionPatch(BaseModel):
 # REST response models
 # ---------------------------------------------------------------------------
 
+class ArmStatus(BaseModel):
+    """Per-arm USB/serial link status for the UI status window."""
+    id: str
+    label: str
+    status: Literal[
+        "ok",
+        "missing",
+        "error",
+        "reconnecting",
+        "initializing",
+    ]
+    detail: str = ""
+    port: Optional[str] = None
+
+
 class HealthResponse(BaseModel):
     ok: bool
     mode: ControllerMode
@@ -84,7 +107,18 @@ class StateSnapshot(BaseModel):
     frame_count: int
     recording_frames: Optional[int] = None
     joint_states: dict = Field(default_factory=dict)
+    master_joint_states: dict = Field(default_factory=dict)
+    slave_joint_states: dict = Field(default_factory=dict)
+    calibration: dict = Field(default_factory=dict)
+    motor_map: dict = Field(default_factory=dict)
+    motor_map_blending: bool = False
     last_error: Optional[str] = None
+    arms: dict = Field(default_factory=dict)
+
+
+class MotorMapRequest(BaseModel):
+    """Master joint → {slave, dir} or legacy string/null."""
+    map: dict[str, Any] = Field(default_factory=dict)
 
 
 class ActionMeta(BaseModel):

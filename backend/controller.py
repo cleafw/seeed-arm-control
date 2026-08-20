@@ -1,11 +1,15 @@
 """Headless teleop / record / playback controller.
 
 Modes:
-    follow              master → slave teleop (default)
+    idle                no teleop; wait for calibration (follower not commanded)
+    follow              master → slave teleop (default after valid calibration)
     record              follow + sampling joint_states into the active recording
     transition          smooth blend from current slave pose → action[0]
     playback            playing back an action (loop or once)
     return_to_follow    after a "once" playback: slow blend → live master pose
+    calibrate           free-move both arms; collect min/max for range mapping
+    free_move           stop teleop; unlock motors (MIT zero / disable, no damping)
+    paused              emergency stop; slave holds last pose
 
 The control loop is a regular Python thread running at UPDATE_RATE Hz. The
 FastAPI layer calls Controller.start_*/stop_* methods (RLock-protected) and
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import threading
 import time
 from copy import deepcopy
@@ -23,8 +28,24 @@ from typing import Optional
 import serial
 import serial.tools.list_ports
 
+from .calibration import (
+    calibration_ready,
+    expand_ranges,
+    load_calibration,
+    ranges_payload,
+    save_calibration,
+    seed_ranges,
+)
 from .config import Config
 from .models import Action, ControllerMode, PlayMode
+from .motor_map import (
+    JOINT_KEYS as MOTOR_MAP_KEYS,
+    apply_motor_map,
+    default_motor_map,
+    load_motor_map,
+    route_range_map,
+    save_motor_map,
+)
 from .pipermate import PiPER_MateAgilex
 from .storage import ActionLibrary
 from .u2can.DM_CAN import (
@@ -47,8 +68,8 @@ def detect_ports(
 ) -> tuple[Optional[str], Optional[str]]:
     """Auto-detect master + slave serial ports.
 
-    Master arm: CH340 (VID=0x1a86, PID=0x7523), the B601-DM driver board.
-    Slave arm: HDSC CDC_Device (manufacturer == "HDSC" or product startswith "CDC").
+    Master (Violin / Arm 102): CH340 FashionStar UART (VID=0x1a86, PID=0x7523).
+    Slave (B601-DM): HDSC CDC Damiao serial bridge.
 
     Multiple candidates → log warning, pick first. None → return None.
     Caller passes env-var overrides as `preferred_master`/`preferred_slave`.
@@ -90,13 +111,14 @@ def detect_ports(
         return cands[0].device
 
     return (
-        pick("master (B601-DM / CH340)", master_candidates, preferred_master),
-        pick("slave (SO102 / HDSC CDC)", slave_candidates, preferred_slave),
+        pick("master (Violin / CH340)", master_candidates, preferred_master),
+        pick("slave (B601-DM / HDSC CDC)", slave_candidates, preferred_slave),
     )
 
 
 # ---------------------------------------------------------------------------
-# Slave arm wrapper
+# Slave arm: B601-DM via project DM_CAN (u2can). LeRobot uses motorbridge;
+# ensure_mode is stricter and fails hard when 24V/CAN is down — keep u2can.
 # ---------------------------------------------------------------------------
 
 class SlaveArm:
@@ -133,7 +155,7 @@ class SlaveArm:
             self.motor_control.enable(motor)
             time.sleep(0.001)
 
-        log.info("[%s] initialized on %s", self.name, self.port)
+        log.info("[%s] initialized on %s (u2can/DM_CAN)", self.name, self.port)
 
     def send_joint_states(self, js: dict) -> None:
         self.motor_control.control_Pos_Vel(self.motors[0], js["joint1"], 15)
@@ -151,11 +173,7 @@ class SlaveArm:
         self.motor_control.control_pos_force(self.motors[6], js["gripper"], 2000, 350)
 
     def recover(self) -> None:
-        """Re-handshake all motors after a single CAN/power line was reconnected.
-
-        Sequence per motor: disable → switchControlMode → enable → refresh_motor_status.
-        Idempotent. Caller must pause the controller first so no commands race.
-        """
+        """Re-handshake all motors after a single CAN/power line was reconnected."""
         if not self.motor_control or not self.motors:
             return
         log.warning("[%s] recover: re-enabling all motors", self.name)
@@ -182,7 +200,6 @@ class SlaveArm:
         log.info("[%s] recover done", self.name)
 
     def get_measured_joint_states(self) -> dict:
-        """Return state_q for each motor (last cache, refreshed by recover())."""
         if not self.motors:
             return {}
         out: dict = {}
@@ -191,6 +208,180 @@ class SlaveArm:
         if len(self.motors) > 6:
             out["gripper"] = float(getattr(self.motors[6], "state_q", 0.0))
         return out
+
+    def poll_measured_joint_states(self) -> dict:
+        """Refresh encoder feedback then return measured joints (for paused UI)."""
+        if not self.motor_control or not self.motors:
+            return {}
+        for motor in self.motors:
+            try:
+                self.motor_control.refresh_motor_status(motor)
+            except Exception:  # noqa: BLE001
+                pass
+        return self.get_measured_joint_states()
+
+    def disable_all(self) -> None:
+        """Legacy: raw disable. Prefer enter_free_move() for hand-guiding."""
+        if not self.motor_control or not self.motors:
+            return
+        for motor in self.motors:
+            try:
+                self.motor_control.disable(motor)
+                try:
+                    self.motor_control.recv()
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception as e:  # noqa: BLE001
+                log.warning("[%s] disable id=%d failed: %s", self.name, motor.SlaveID, e)
+            time.sleep(0.005)
+        log.info("[%s] all motors disabled", self.name)
+
+    def enter_free_move(self) -> None:
+        """MIT zero-torque (or stay disabled) so the arm can be hand-moved.
+
+        J1 (motors[0], DM4340 base) stays DISABLED — MIT zero-torque still feels
+        braked on this joint for some units. Other joints use MIT kp=kd=τ=0.
+        Never re-enable a motor still stuck in POS_VEL.
+        """
+        if not self.motor_control or not self.motors:
+            return
+        self._mit_free_motors: list = []
+        self._disable_only_motors: list = []
+        for idx, motor in enumerate(self.motors):
+            try:
+                self.motor_control.disable(motor)
+                time.sleep(0.02)
+                try:
+                    self.motor_control.recv()
+                except Exception:  # noqa: BLE001
+                    pass
+
+                # J1: force disable-only freewheel (no MIT enable).
+                if idx == 0:
+                    self.motor_control.disable(motor)
+                    self._disable_only_motors.append(motor)
+                    log.info(
+                        "[%s] J1 id=%d free-move = DISABLED (no MIT)",
+                        self.name,
+                        motor.SlaveID,
+                    )
+                    continue
+
+                ok = False
+                for _ in range(4):
+                    if self.motor_control.switchControlMode(motor, Control_Type.MIT):
+                        ok = True
+                        break
+                    self.motor_control.disable(motor)
+                    time.sleep(0.05)
+
+                if ok:
+                    self.motor_control.enable(motor)
+                    time.sleep(0.01)
+                    self._mit_free_motors.append(motor)
+                else:
+                    self.motor_control.disable(motor)
+                    self._disable_only_motors.append(motor)
+                    log.warning(
+                        "[%s] MIT switch failed id=%d — left DISABLED for freewheel",
+                        self.name,
+                        motor.SlaveID,
+                    )
+            except Exception as e:  # noqa: BLE001
+                log.warning("[%s] enter_free_move id=%d failed: %s", self.name, motor.SlaveID, e)
+        self._free_move = True
+        self.hold_free_move()
+        log.info(
+            "[%s] free-move ON (MIT ids=%s, disabled=%s)",
+            self.name,
+            [m.SlaveID for m in self._mit_free_motors],
+            [m.SlaveID for m in self._disable_only_motors],
+        )
+
+    def hold_free_move(self) -> dict:
+        """Zero-torque MIT for soft joints; re-assert disable for J1 / failed ones."""
+        if not self.motor_control or not self.motors:
+            return {}
+        mit_set = set(getattr(self, "_mit_free_motors", []) or [])
+        dis_set = set(getattr(self, "_disable_only_motors", []) or [])
+        for motor in self.motors:
+            try:
+                if motor in mit_set:
+                    self.motor_control.controlMIT(motor, 0.0, 0.0, 0.0, 0.0, 0.0)
+                else:
+                    if motor in dis_set:
+                        now = time.monotonic()
+                        # Re-assert disable ~2Hz — every-tick disable floods CAN/USB.
+                        if now - float(getattr(self, "_j1_disable_ts", 0.0) or 0.0) >= 0.5:
+                            self._j1_disable_ts = now
+                            self.motor_control.disable(motor)
+                    self.motor_control.refresh_motor_status(motor)
+                err = int(getattr(motor, "state_err", 0) or 0)
+                if err and self.motors and motor is self.motors[0]:
+                    now = time.monotonic()
+                    last = float(getattr(self, "_j1_fault_log_ts", 0.0) or 0.0)
+                    if now - last > 2.0:
+                        self._j1_fault_log_ts = now
+                        log.warning(
+                            "[%s] J1 fault nibble=0x%X — may need power cycle if still stiff",
+                            self.name,
+                            err,
+                        )
+            except Exception as e:  # noqa: BLE001
+                log.debug("[%s] free-move id=%d: %s", self.name, motor.SlaveID, e)
+            time.sleep(0.0004)
+        return self.get_measured_joint_states()
+
+    def enable_all(self) -> None:
+        """Leave free-move / re-enable POS_VEL (gripper Torque_Pos) for teleop."""
+        if not self.motor_control or not self.motors:
+            return
+        self._free_move = False
+        self._mit_free_motors = []
+        self._disable_only_motors = []
+        for idx, motor in enumerate(self.motors):
+            try:
+                self.motor_control.disable(motor)
+                time.sleep(0.02)
+                try:
+                    self.motor_control.recv()
+                except Exception:  # noqa: BLE001
+                    pass
+                mode = Control_Type.Torque_Pos if motor is self.motors[6] else Control_Type.POS_VEL
+                ok = False
+                # J1 (DM4340) is stubborn after long DISABLED free-move — more retries.
+                attempts = 6 if idx == 0 else 3
+                for _ in range(attempts):
+                    if self.motor_control.switchControlMode(motor, mode):
+                        ok = True
+                        break
+                    time.sleep(0.05)
+                if not ok:
+                    log.warning(
+                        "[%s] switchControlMode failed id=%d (want %s) — enabling anyway",
+                        self.name,
+                        motor.SlaveID,
+                        mode,
+                    )
+                self.motor_control.enable(motor)
+                time.sleep(0.02)
+                try:
+                    self.motor_control.refresh_motor_status(motor)
+                except Exception:  # noqa: BLE001
+                    pass
+                if idx == 0:
+                    err = int(getattr(motor, "state_err", 0) or 0)
+                    log.info(
+                        "[%s] J1 re-enabled (mode_ok=%s, err=0x%X, q=%.3f)",
+                        self.name,
+                        ok,
+                        err,
+                        float(getattr(motor, "state_q", 0.0) or 0.0),
+                    )
+            except Exception as e:  # noqa: BLE001
+                log.warning("[%s] enable id=%d failed: %s", self.name, motor.SlaveID, e)
+            time.sleep(0.01)
+        log.info("[%s] all motors enabled (POS_VEL)", self.name)
 
     def safe_shutdown(self, duration: float = 2.0, steps: int = 20) -> None:
         if not self.motor_control or not self.motors:
@@ -240,6 +431,37 @@ class SlaveArm:
         except Exception as e:  # noqa: BLE001
             log.warning("[%s] close failed: %s", self.name, e)
 
+    def check_link(self) -> None:
+        """Raise if USB node is gone, serial closed, or motors stop answering."""
+        if not self.port or not os.path.exists(self.port):
+            raise OSError(f"[{self.name}] port missing: {self.port}")
+        if self.serial_device is None or not self.serial_device.is_open:
+            raise OSError(f"[{self.name}] serial closed")
+        if not self.motor_control or not self.motors:
+            raise OSError(f"[{self.name}] motors not initialized")
+        try:
+            _ = self.serial_device.in_waiting
+        except Exception as e:  # noqa: BLE001
+            raise OSError(f"[{self.name}] serial dead: {e}") from e
+
+        # Probe up to 3 joints — need at least one CAN status frame back.
+        for motor in self.motors[:3]:
+            before = getattr(motor, "_rx_gen", 0)
+            try:
+                self.motor_control.refresh_motor_status(motor)
+                time.sleep(0.02)
+                try:
+                    self.motor_control.recv()
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception as e:  # noqa: BLE001
+                raise OSError(f"[{self.name}] refresh failed: {e}") from e
+            if getattr(motor, "_rx_gen", 0) > before:
+                return
+        raise RuntimeError(
+            f"[{self.name}] no motor feedback (USB unplugged or arm power off)"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Mock master / slave — for laptop testing without hardware
@@ -276,6 +498,9 @@ class MockMaster:
     def close(self) -> None:
         pass
 
+    def check_link(self) -> None:
+        return
+
 
 class MockSlave:
     """Stand-in for SlaveArm. Accepts joint targets but does nothing."""
@@ -288,20 +513,37 @@ class MockSlave:
         log.info("[%s] mock slave initialized (no serial I/O)", self.name)
 
     def send_joint_states(self, js: dict) -> None:
-        # No-op. The Controller still records last_output_joint_states from
-        # this call's argument, which is what the WS snapshot exposes.
-        return
+        # Echo commanded pose as "measured" so the UI dual bars work in mock.
+        self._measured = dict(js)
 
     def recover(self) -> None:
         return
 
     def get_measured_joint_states(self) -> dict:
-        return {}
+        return dict(getattr(self, "_measured", {}) or {})
+
+    def poll_measured_joint_states(self) -> dict:
+        return self.get_measured_joint_states()
+
+    def disable_all(self) -> None:
+        return
+
+    def enter_free_move(self) -> None:
+        return
+
+    def hold_free_move(self) -> dict:
+        return self.get_measured_joint_states()
+
+    def enable_all(self) -> None:
+        return
 
     def safe_shutdown(self, duration: float = 2.0, steps: int = 20) -> None:
         return
 
     def close(self) -> None:
+        return
+
+    def check_link(self) -> None:
         return
 
 
@@ -321,7 +563,6 @@ class Controller:
         # ---- runtime state (all guarded by self.lock) ----
         self.lock = threading.RLock()
         self.running = True
-        self.mode: ControllerMode = "follow"
         self.safety_enabled: bool = cfg.safety_default_enabled
         self._recovering: bool = False
 
@@ -351,9 +592,58 @@ class Controller:
 
         # Master/slave shared state
         self.last_joint_states: Optional[dict] = None        # last master read
-        self.last_output_joint_states: Optional[dict] = None # last slave write
+        self.last_output_joint_states: Optional[dict] = None # last slave write (mapped)
+        self.last_safety_joint_states: Optional[dict] = None  # last master-space safety baseline
+        self.last_measured_joint_states: Optional[dict] = None  # slave encoder
         self.frame_count: int = 0
         self.last_error: Optional[str] = None
+
+        # Per-arm USB/serial link status (surfaced in UI status window)
+        self._arm_status: dict[str, dict] = {
+            "master": {
+                "id": "master",
+                "label": "主臂",
+                "status": "initializing",
+                "detail": "",
+                "port": None,
+            },
+            "slave": {
+                "id": "slave",
+                "label": "从臂",
+                "status": "initializing",
+                "detail": "",
+                "port": None,
+            },
+        }
+        self._arms_hint: Optional[str] = None
+        self._last_reconnect_attempt: float = 0.0
+        self._reconnect_interval_s: float = 2.0
+        self._arms_were_ready: bool = False
+        self._ever_had_link_fault: bool = False
+        self._probe_fail_counts: dict[str, int] = {"master": 0, "slave": 0}
+        self._probe_fail_limit: int = 2
+
+        # Calibration ranges (live session + last saved)
+        cal_path = self.cfg.recordings_dir / "calibration.json"
+        self._calibration_path = cal_path
+        m_r, s_r, saved_at = load_calibration(cal_path)
+        self.cal_master_ranges = m_r
+        self.cal_slave_ranges = s_r
+        self.cal_saved_at: Optional[str] = saved_at
+        self._calibrating = False
+        self._j1_disable_ts = 0.0
+        self._j1_fault_log_ts = 0.0
+        # Master→slave motor routing (identity by default)
+        map_path = self.cfg.recordings_dir / "motor_map.json"
+        self._motor_map_path = map_path
+        self.motor_map = load_motor_map(map_path)
+        # Soft blend after motor_map change (slave-space from → live mapped target)
+        self._mmap_blend_start: Optional[float] = None
+        self._mmap_blend_from: Optional[dict] = None
+        # Teleop only after a valid calibration is saved.
+        self.mode: ControllerMode = (
+            "follow" if calibration_ready(m_r, s_r) else "idle"
+        )
 
         # Hardware (set in setup_hardware)
         self.master: Optional[PiPER_MateAgilex] = None
@@ -363,8 +653,31 @@ class Controller:
         self._listeners: list = []
 
     # ------------------------------------------------------------------
-    # Hardware setup / teardown
+    # Hardware setup / teardown / reconnect
     # ------------------------------------------------------------------
+    def arm_connected(self, which: str) -> bool:
+        st = self._arm_status.get(which) or {}
+        return st.get("status") == "ok"
+
+    def arms_ready(self) -> bool:
+        return self.arm_connected("master") and self.arm_connected("slave")
+
+    def _set_arm_status(
+        self,
+        which: str,
+        status: str,
+        *,
+        detail: str = "",
+        port: Optional[str] = None,
+    ) -> None:
+        cur = self._arm_status.get(which)
+        if cur is None:
+            return
+        cur["status"] = status
+        cur["detail"] = detail or ""
+        if port is not None:
+            cur["port"] = port
+
     def setup_hardware(self) -> None:
         if self.cfg.mock:
             log.warning(
@@ -375,46 +688,23 @@ class Controller:
             mock_slave = MockSlave("mock_slave_1")
             mock_slave.setup()
             self.slaves = [mock_slave]
+            self._set_arm_status("master", "ok", detail="mock", port="<mock>")
+            self._set_arm_status("slave", "ok", detail="mock", port="<mock>")
+            self._arms_were_ready = True
+            self._arms_hint = None
             return
 
-        master_port = self.cfg.master_port
-        slave_port = self.cfg.slave_port
-        if not master_port or not slave_port:
-            detected_master, detected_slave = detect_ports(master_port, slave_port)
-            master_port = master_port or detected_master
-            slave_port = slave_port or detected_slave
-        if not master_port:
-            raise RuntimeError("Master arm port not found; set MASTER_PORT or check USB")
-        if not slave_port:
-            raise RuntimeError("Slave arm port not found; set SLAVE_PORT or check USB")
-
-        slave = SlaveArm(slave_port, self.cfg.baudrate, "slave_1")
-        slave.setup()
-        self.slaves = [slave]
-
-        self.master = PiPER_MateAgilex(
-            fashionstar_port=master_port,
-            gripper_exist=self.cfg.gripper_exist,
-        )
-        log.info("Master arm initialized on %s", master_port)
+        self._set_arm_status("master", "initializing", detail="正在连接…")
+        self._set_arm_status("slave", "initializing", detail="正在连接…")
+        # Soft connect: missing/failed ports leave the HTTP server up and
+        # the control loop will keep retrying until both arms are back.
+        self._try_reconnect(force=True)
 
     def cleanup(self) -> None:
         log.info("Cleaning up hardware...")
         self.running = False
-        try:
-            if self.master is not None:
-                self.master.close()
-        except Exception as e:  # noqa: BLE001
-            log.warning("Master close failed: %s", e)
-        for s in self.slaves:
-            try:
-                s.safe_shutdown()
-            except Exception as e:  # noqa: BLE001
-                log.warning("[%s] safe_shutdown failed: %s", s.name, e)
-            try:
-                s.close()
-            except Exception as e:  # noqa: BLE001
-                log.warning("[%s] close failed: %s", s.name, e)
+        self._drop_master(quiet=True)
+        self._drop_slave(quiet=True, safe=True)
         log.info("Cleanup complete.")
 
     def request_shutdown(self) -> None:
@@ -424,6 +714,297 @@ class Controller:
     def add_listener(self, fn) -> None:
         """Register fn(snapshot_dict). Called from the control thread."""
         self._listeners.append(fn)
+
+    def _drop_master(self, *, quiet: bool = False) -> None:
+        m = self.master
+        self.master = None
+        if m is None:
+            return
+        try:
+            m.close()
+        except Exception as e:  # noqa: BLE001
+            if not quiet:
+                log.warning("Master close failed: %s", e)
+
+    def _drop_slave(self, *, quiet: bool = False, safe: bool = False) -> None:
+        slaves = list(self.slaves)
+        self.slaves = []
+        for s in slaves:
+            if safe:
+                try:
+                    s.safe_shutdown()
+                except Exception as e:  # noqa: BLE001
+                    if not quiet:
+                        log.warning("[%s] safe_shutdown failed: %s", s.name, e)
+            try:
+                s.close()
+            except Exception as e:  # noqa: BLE001
+                if not quiet:
+                    log.warning("[%s] close failed: %s", s.name, e)
+
+    @staticmethod
+    def _is_link_error(exc: BaseException) -> bool:
+        if isinstance(exc, serial.SerialException):
+            return True
+        if isinstance(exc, OSError):
+            return True
+        if isinstance(exc, RuntimeError):
+            msg = str(exc).lower()
+            return any(
+                tok in msg
+                for tok in (
+                    "serial",
+                    "i/o",
+                    "input/output",
+                    "port missing",
+                    "no motor feedback",
+                    "no fresh",
+                    "not responding",
+                    "power off",
+                    "usb",
+                    "bus closed",
+                    "serial closed",
+                )
+            )
+        msg = str(exc).lower()
+        return any(
+            tok in msg
+            for tok in ("serial", "i/o error", "input/output", "device disconnected")
+        )
+
+    def _probe_links(self) -> Optional[str]:
+        """Active liveness check. Returns which arm failed, or None if both OK.
+
+        Detects USB unplug (device node gone) and power-off (no servo/CAN reply)
+        even when the control mode is paused and would not otherwise touch hardware.
+        Requires ``_probe_fail_limit`` consecutive failures to avoid one-shot flicker.
+        """
+        if self.cfg.mock:
+            return None
+
+        def _fail(which: str, err: BaseException) -> Optional[str]:
+            self._probe_fail_counts[which] = self._probe_fail_counts.get(which, 0) + 1
+            n = self._probe_fail_counts[which]
+            log.error("%s link probe fail %d/%d: %s", which, n, self._probe_fail_limit, err)
+            if n >= self._probe_fail_limit:
+                self._probe_fail_counts[which] = 0
+                self._enter_link_fault(which, err)
+                return which
+            return None
+
+        if self.master is not None and self.arm_connected("master"):
+            try:
+                port = getattr(self.master, "port", None)
+                if port and not os.path.exists(port):
+                    raise OSError(f"leader port missing: {port}")
+                if hasattr(self.master, "check_link"):
+                    self.master.check_link()
+                self._probe_fail_counts["master"] = 0
+            except Exception as e:  # noqa: BLE001
+                hit = _fail("master", e)
+                if hit:
+                    return hit
+
+        if self.slaves and self.arm_connected("slave"):
+            for slave in list(self.slaves):
+                try:
+                    port = getattr(slave, "port", None)
+                    if port and port != "<mock>" and not os.path.exists(port):
+                        raise OSError(f"[{slave.name}] port missing: {port}")
+                    if hasattr(slave, "check_link"):
+                        slave.check_link()
+                    self._probe_fail_counts["slave"] = 0
+                except Exception as e:  # noqa: BLE001
+                    hit = _fail("slave", e)
+                    if hit:
+                        return hit
+        return None
+
+    def _enter_link_fault(self, which: str, err: BaseException) -> None:
+        """Mark arm(s) down, pause teleop, keep HTTP/WS alive for reconnect."""
+        detail = f"{type(err).__name__}: {err}"
+        log.error("Arm link fault (%s): %s", which, detail)
+        with self.lock:
+            self._stop_active_locked()
+            if which in ("master", "both"):
+                self._set_arm_status("master", "error", detail=detail)
+            if which in ("slave", "both"):
+                self._set_arm_status("slave", "error", detail=detail)
+            self.last_error = f"串口异常 ({'主臂' if which == 'master' else '从臂' if which == 'slave' else '双臂'}): {err}"
+            self._arms_hint = "串口异常，正在等待机械臂重新接入…"
+            self._arms_were_ready = False
+            self._ever_had_link_fault = True
+            # Wait for unlock after reconnect (same UX as e-stop).
+            if calibration_ready(self.cal_master_ranges, self.cal_slave_ranges):
+                self.mode = "paused"
+            else:
+                self.mode = "idle"
+        if which in ("master", "both"):
+            self._drop_master()
+        if which in ("slave", "both"):
+            self._drop_slave(safe=False)
+
+    def _resolve_ports(self) -> tuple[Optional[str], Optional[str]]:
+        master_port = self.cfg.master_port
+        slave_port = self.cfg.slave_port
+        if not master_port or not slave_port:
+            detected_master, detected_slave = detect_ports(master_port, slave_port)
+            master_port = master_port or detected_master
+            slave_port = slave_port or detected_slave
+        return master_port, slave_port
+
+    def _open_master(self, port: str) -> None:
+        self._drop_master(quiet=True)
+        self.master = PiPER_MateAgilex(
+            fashionstar_port=port,
+            gripper_exist=self.cfg.gripper_exist,
+            fashionstar_baud=self.cfg.master_baudrate,
+        )
+        try:
+            if hasattr(self.master, "check_link"):
+                self.master.check_link()
+        except Exception:
+            self._drop_master(quiet=True)
+            raise
+        self._set_arm_status("master", "ok", detail="已连接", port=port)
+        log.info("Master arm initialized on %s (baud=%s)", port, self.cfg.master_baudrate)
+
+    def _open_slave(self, port: str) -> None:
+        self._drop_slave(quiet=True, safe=False)
+        slave = SlaveArm(port, self.cfg.baudrate, "slave_1")
+        slave.setup()
+        try:
+            slave.check_link()
+        except Exception:
+            try:
+                slave.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        self.slaves = [slave]
+        self._set_arm_status("slave", "ok", detail="已连接", port=port)
+        log.info("Slave arm initialized on %s", port)
+
+    def _try_reconnect(self, *, force: bool = False) -> None:
+        """Attempt to (re)open missing/failed arms. Safe to call often."""
+        if self.cfg.mock:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_reconnect_attempt) < self._reconnect_interval_s:
+            return
+        self._last_reconnect_attempt = now
+
+        need_master = self.master is None or self._arm_status["master"]["status"] != "ok"
+        need_slave = (not self.slaves) or self._arm_status["slave"]["status"] != "ok"
+        if not need_master and not need_slave:
+            return
+
+        master_port, slave_port = self._resolve_ports()
+
+        if need_master:
+            self._set_arm_status(
+                "master",
+                "reconnecting",
+                detail="正在重连…",
+                port=master_port,
+            )
+            if not master_port:
+                self._set_arm_status(
+                    "master",
+                    "missing",
+                    detail="未检测到串口（CH340 /dev/rebot-master）",
+                )
+            else:
+                try:
+                    self._open_master(master_port)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Master reconnect failed: %s", e)
+                    self._drop_master(quiet=True)
+                    self._set_arm_status(
+                        "master",
+                        "error",
+                        detail=str(e),
+                        port=master_port,
+                    )
+
+        if need_slave:
+            self._set_arm_status(
+                "slave",
+                "reconnecting",
+                detail="正在重连…",
+                port=slave_port,
+            )
+            if not slave_port:
+                self._set_arm_status(
+                    "slave",
+                    "missing",
+                    detail="未检测到串口（HDSC CDC /dev/rebot-slave）",
+                )
+            else:
+                try:
+                    self._open_slave(slave_port)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Slave reconnect failed: %s", e)
+                    self._drop_slave(quiet=True, safe=False)
+                    self._set_arm_status(
+                        "slave",
+                        "error",
+                        detail=str(e),
+                        port=slave_port,
+                    )
+
+        if self.arms_ready() and not self._arms_were_ready:
+            self._arms_were_ready = True
+            if self._ever_had_link_fault:
+                self._on_arms_reconnected()
+            else:
+                self._arms_hint = None
+                log.info("Both arms connected (initial)")
+
+    def _on_arms_reconnected(self) -> None:
+        """Both links OK after a fault → re-init pose baseline, wait for unlock → follow."""
+        log.warning("Both arms reconnected after fault — waiting for unlock to follow")
+        for slave in self.slaves:
+            try:
+                if hasattr(slave, "recover"):
+                    slave.recover()
+            except Exception as e:  # noqa: BLE001
+                log.warning("post-reconnect recover failed: %s", e)
+
+        measured: dict = {}
+        for slave in self.slaves:
+            try:
+                if hasattr(slave, "poll_measured_joint_states"):
+                    measured = slave.poll_measured_joint_states() or {}
+                elif hasattr(slave, "get_measured_joint_states"):
+                    measured = slave.get_measured_joint_states() or {}
+                if measured:
+                    break
+            except Exception as e:  # noqa: BLE001
+                log.debug("post-reconnect measured: %s", e)
+
+        master_js: Optional[dict] = None
+        if self.master:
+            try:
+                master_js = self.master.get_fashionstar_joint_states() or None
+            except Exception as e:  # noqa: BLE001
+                log.warning("post-reconnect master poll: %s", e)
+
+        with self.lock:
+            self.last_error = None
+            if measured:
+                self.last_measured_joint_states = deepcopy(measured)
+                self.last_output_joint_states = deepcopy(measured)
+            if master_js:
+                self.last_joint_states = deepcopy(master_js)
+                self.last_safety_joint_states = deepcopy(master_js)
+            self._stop_active_locked()
+            if calibration_ready(self.cal_master_ranges, self.cal_slave_ranges):
+                self.mode = "paused"
+                self._arms_hint = "机械臂已恢复，请点击「解除锁定」进入跟随"
+            else:
+                self.mode = "idle"
+                self._arms_hint = "机械臂已恢复，请先完成校准"
 
     # ------------------------------------------------------------------
     # Math helpers
@@ -454,30 +1035,67 @@ class Controller:
     def _blend(js_from: dict, js_to: dict, alpha: float) -> dict:
         a = max(0.0, min(1.0, alpha))
         a = a * a * (3 - 2 * a)
-        return {k: js_from[k] + a * (js_to[k] - js_from[k]) for k in js_from}
+        keys = set(js_from) | set(js_to)
+        out: dict = {}
+        for k in keys:
+            v0 = js_from.get(k, js_to.get(k))
+            v1 = js_to.get(k, js_from.get(k))
+            if isinstance(v0, (int, float)) and isinstance(v1, (int, float)):
+                out[k] = float(v0) + a * (float(v1) - float(v0))
+        return out
 
     def _current_output_js(self) -> Optional[dict]:
+        """Current follower command pose in slave/hardware space."""
         if self.last_output_joint_states is not None:
             return deepcopy(self.last_output_joint_states)
+        if self.last_measured_joint_states is not None:
+            return deepcopy(self.last_measured_joint_states)
         if self.last_joint_states is not None:
-            return deepcopy(self.last_joint_states)
+            # last_joint is master-space — convert before using as a blend endpoint.
+            return deepcopy(self._map_for_slave(self.last_joint_states))
         return None
 
     def _broadcast_to_slaves(self, js: dict) -> None:
         for slave in self.slaves:
-            slave.send_joint_states(js)
+            try:
+                slave.send_joint_states(js)
+            except Exception as e:  # noqa: BLE001
+                if self._is_link_error(e):
+                    raise
+                log.warning("[%s] send_joint_states failed: %s", slave.name, e)
+                raise
         self.last_output_joint_states = deepcopy(js)
+        # control_Pos_Vel already updates state_q via feedback; cache for UI.
+        self._cache_measured_from_slaves(poll=False)
+
+    def _cache_measured_from_slaves(self, *, poll: bool = False) -> None:
+        """Update last_measured_joint_states from the first slave that responds."""
+        for slave in self.slaves:
+            try:
+                if poll and hasattr(slave, "poll_measured_joint_states"):
+                    m = slave.poll_measured_joint_states()
+                elif hasattr(slave, "get_measured_joint_states"):
+                    m = slave.get_measured_joint_states()
+                else:
+                    continue
+                if m:
+                    self.last_measured_joint_states = deepcopy(m)
+                    return
+            except Exception as e:  # noqa: BLE001
+                if self._is_link_error(e):
+                    raise
+                log.debug("measured poll failed: %s", e)
 
     def _apply_safety(self, js: dict, dt: float) -> Optional[dict]:
-        """Filter master input before sending to slave.
+        """Filter master input before mapping/sending to slave.
 
-        Returns the slew-limited joint dict, or None if a spike was detected
-        (caller should pause). Gripper is passed through untouched.
-        Operates against last_output_joint_states; first-tick has no baseline
-        so we let the raw frame through.
+        Spike / slew limits MUST use master-space baselines. Comparing against
+        last_output (mapped slave command) false-triggers after calibration.
+        Returns slew-limited master joints, or None if a spike was detected.
         """
-        last = self.last_output_joint_states
+        last = self.last_safety_joint_states
         if last is None:
+            self.last_safety_joint_states = deepcopy(js)
             return js
         spike = self.cfg.spike_threshold_rad
         for k, v in js.items():
@@ -499,7 +1117,17 @@ class Controller:
                 out[k] = last[k] - max_step
             else:
                 out[k] = v
+        self.last_safety_joint_states = deepcopy(out)
         return out
+
+    def _rebase_teleop_baseline(self, master_js: Optional[dict]) -> None:
+        """Reset safety + output baselines so the next follow tick won't false-spike."""
+        if not master_js:
+            return
+        self.last_joint_states = deepcopy(master_js)
+        self.last_safety_joint_states = deepcopy(master_js)
+        # last_output stays in slave/command space (mapped when calibration is on).
+        self.last_output_joint_states = deepcopy(self._map_for_slave(master_js))
 
     # ------------------------------------------------------------------
     # Public commands (called by REST handlers)
@@ -508,7 +1136,12 @@ class Controller:
         with self.lock:
             if self.mode == "record":
                 raise ControllerError("Already recording")
+            if self.mode == "calibrate":
+                raise ControllerError("Finish or abort calibration before recording")
+            if self.mode == "idle" or not self._calibration_mapping_enabled():
+                raise ControllerError("需要先完成校准才能录制")
             self._stop_active_locked()
+            self._calibrating = False
             self.record_buffer = []
             self.record_action_name = name
             self.record_start_time = time.monotonic()
@@ -554,8 +1187,10 @@ class Controller:
             raise ControllerError(f"Action {action_id} has no frames")
         with self.lock:
             self._stop_active_locked()
-            from_js = self._current_output_js()
-            to_js = deepcopy(action.frames[0]["joint_states"])
+            from_js = self._current_output_js()  # slave/hardware space
+            # Action frames are recorded in MASTER space; convert the start
+            # pose to slave space so the transition blend never mixes spaces.
+            to_js = self._map_for_slave(action.frames[0]["joint_states"])
             if from_js is None:
                 # No reference pose yet — start playback immediately.
                 self._begin_playback_locked(action, mode)
@@ -566,7 +1201,11 @@ class Controller:
             self.transition_target_action = action
             self.transition_target_mode = mode
             self.mode = "transition"
-            log.info("Transition → action %s (mode=%s)", action.id, mode)
+            log.info(
+                "Transition → action %s (mode=%s, slave-space blend)",
+                action.id,
+                mode,
+            )
             return action
 
     def stop_playback(self) -> None:
@@ -578,31 +1217,417 @@ class Controller:
     def force_follow(self) -> None:
         with self.lock:
             self._stop_active_locked()
+            self._calibrating = False
+            if not calibration_ready(self.cal_master_ranges, self.cal_slave_ranges):
+                self.mode = "idle"
+                log.info("Forced idle (no valid calibration — teleop blocked)")
+                return
             self.mode = "follow"
             log.info("Forced follow mode")
+        for slave in self.slaves:
+            try:
+                if hasattr(slave, "enable_all"):
+                    slave.enable_all()
+            except Exception as e:  # noqa: BLE001
+                log.warning("enable_all on force_follow: %s", e)
+
+    def start_calibrate(self) -> None:
+        """Enter calibrate mode: free-move follower; collect min/max ranges."""
+        with self.lock:
+            if self.mode == "calibrate":
+                raise ControllerError("Already calibrating")
+            if self.mode not in ("follow", "paused", "idle", "free_move"):
+                raise ControllerError(f"Cannot start calibration from mode={self.mode}")
+            self._stop_active_locked()
+            # Stop teleop commands BEFORE touching serial for free-move.
+            self._calibrating = True
+            self.mode = "calibrate"
+
+        # Free-move both arms (outside lock; control loop no longer broadcasts).
+        for slave in self.slaves:
+            try:
+                if hasattr(slave, "enter_free_move"):
+                    slave.enter_free_move()
+                elif hasattr(slave, "disable_all"):
+                    slave.disable_all()
+            except Exception as e:  # noqa: BLE001
+                log.warning("enter_free_move failed: %s", e)
+
+        with self.lock:
+            if self.mode != "calibrate":
+                return
+            self._cache_measured_from_slaves(poll=True)
+            master_js = self.last_joint_states
+            if self.master:
+                try:
+                    master_js = self.master.get_fashionstar_joint_states() or master_js
+                    if master_js:
+                        self.last_joint_states = deepcopy(master_js)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("master read at calibrate start: %s", e)
+            slave_js = self.last_measured_joint_states or self.last_output_joint_states
+            self.cal_master_ranges = seed_ranges(master_js)
+            self.cal_slave_ranges = seed_ranges(slave_js)
+            log.info(
+                "Calibration started — hand-move BOTH arms through full range "
+                "(follower MIT zero-torque free-move)"
+            )
+
+    def finish_calibrate(self) -> dict:
+        """Validate swept ranges, persist, re-enable motors, return to follow."""
+        with self.lock:
+            if self.mode != "calibrate":
+                raise ControllerError("Not currently calibrating")
+            if not calibration_ready(self.cal_master_ranges, self.cal_slave_ranges):
+                raise ControllerError(
+                    "校准范围不足：请把主臂、从臂每个关节都转到机械极限后再完成"
+                )
+            saved_at = save_calibration(
+                self._calibration_path,
+                self.cal_master_ranges,
+                self.cal_slave_ranges,
+            )
+            self.cal_saved_at = saved_at
+            self._calibrating = False
+            self.mode = "follow"
+            # Seed baselines from live master so first follow tick won't spike.
+            master_js = self.last_joint_states
+            if self.master:
+                try:
+                    master_js = self.master.get_fashionstar_joint_states() or master_js
+                except Exception:  # noqa: BLE001
+                    pass
+            if master_js:
+                self.last_joint_states = deepcopy(master_js)
+            payload = ranges_payload(
+                self.cal_master_ranges,
+                self.cal_slave_ranges,
+                active=False,
+                saved_at=saved_at,
+                mapping_enabled=True,
+            )
+            log.info("Calibration finished (saved_at=%s, mapping ON)", saved_at)
+
+        for slave in self.slaves:
+            try:
+                if hasattr(slave, "enable_all"):
+                    slave.enable_all()
+            except Exception as e:  # noqa: BLE001
+                log.warning("enable_all failed: %s", e)
+
+        with self.lock:
+            self._rebase_teleop_baseline(self.last_joint_states)
+        return payload
+
+    def cancel_calibrate(self) -> None:
+        """Abort calibration without saving; do NOT enable teleop / command poses."""
+        with self.lock:
+            if self.mode != "calibrate":
+                raise ControllerError("Not currently calibrating")
+            m_r, s_r, saved_at = load_calibration(self._calibration_path)
+            self.cal_master_ranges = m_r
+            self.cal_slave_ranges = s_r
+            self.cal_saved_at = saved_at
+            self._calibrating = False
+            # Always idle after cancel — never snap follower to master pose.
+            self.mode = "idle"
+            log.info(
+                "Calibration cancelled — discarded in-session ranges (idle, motors stay free)"
+            )
+
+        # Keep motors disabled / free; do not enable_all (would command POS_VEL).
+        for slave in self.slaves:
+            try:
+                if hasattr(slave, "disable_all"):
+                    slave.disable_all()
+            except Exception as e:  # noqa: BLE001
+                log.warning("disable_all after calibrate cancel: %s", e)
+
+    def _calibration_mapping_enabled(self) -> bool:
+        return (
+            not self._calibrating
+            and calibration_ready(self.cal_master_ranges, self.cal_slave_ranges)
+        )
+
+    def set_motor_map(self, mapping: dict) -> dict:
+        """Persist master→slave routing; soft-blend slave to the new mapped pose."""
+        with self.lock:
+            from_js = deepcopy(
+                self.last_output_joint_states
+                or self.last_measured_joint_states
+                or {}
+            )
+            self.motor_map = save_motor_map(self._motor_map_path, mapping)
+            # Do NOT snap last_output — blend in follow/record so remapped
+            # motors ease into the new target instead of jumping.
+            if (
+                from_js
+                and self.mode in ("follow", "record")
+                and self.last_joint_states
+            ):
+                target = self._map_for_slave(self.last_joint_states)
+                if self._joint_delta(from_js, target) > 1e-3:
+                    self._mmap_blend_start = time.monotonic()
+                    self._mmap_blend_from = from_js
+                    log.info(
+                        "Motor map updated; blending slave over %.1fs",
+                        self.cfg.return_time_s,
+                    )
+                else:
+                    self._mmap_blend_start = None
+                    self._mmap_blend_from = None
+                    log.info("Motor map updated (no pose change)")
+            else:
+                self._mmap_blend_start = None
+                self._mmap_blend_from = None
+                log.info("Motor map updated: %s", self.motor_map)
+            return {k: self.motor_map.get(k) for k in MOTOR_MAP_KEYS}
+
+    @staticmethod
+    def _joint_delta(a: dict, b: dict) -> float:
+        keys = set(a) | set(b)
+        best = 0.0
+        for k in keys:
+            av, bv = a.get(k), b.get(k)
+            if isinstance(av, (int, float)) and isinstance(bv, (int, float)):
+                best = max(best, abs(float(av) - float(bv)))
+        return best
+
+    def _apply_mmap_blend(self, target: dict) -> dict:
+        """Ease slave from pose-at-remap toward the live remapped target."""
+        start = self._mmap_blend_start
+        from_js = self._mmap_blend_from
+        if start is None or not from_js:
+            return target
+        T = max(0.05, float(self.cfg.return_time_s))
+        elapsed = time.monotonic() - start
+        if elapsed >= T:
+            self._mmap_blend_start = None
+            self._mmap_blend_from = None
+            return target
+        alpha = min(1.0, elapsed / T)
+        alpha = alpha * alpha * (3 - 2 * alpha)
+        keys = set(from_js) | set(target)
+        out: dict[str, float] = {}
+        for k in keys:
+            a = from_js.get(k, target.get(k))
+            b = target.get(k, from_js.get(k))
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                out[k] = float(a) + alpha * (float(b) - float(a))
+        return out
+
+    def _clear_mmap_blend(self) -> None:
+        self._mmap_blend_start = None
+        self._mmap_blend_from = None
+
+    def _map_for_slave(self, master_js: dict) -> dict:
+        """Range-map (if calibrated) then route into slave motors per motor_map.
+
+        Unmapped slave motors keep the last commanded / measured pose.
+        """
+        hold = self.last_output_joint_states or self.last_measured_joint_states or {}
+        mapping = self.motor_map or default_motor_map()
+        if self._calibration_mapping_enabled():
+            routed = route_range_map(
+                master_js,
+                self.cal_master_ranges,
+                self.cal_slave_ranges,
+                mapping,
+            )
+            out: dict[str, float] = {}
+            for sk in MOTOR_MAP_KEYS:
+                if sk in routed:
+                    out[sk] = float(routed[sk])
+                elif isinstance(hold.get(sk), (int, float)):
+                    out[sk] = float(hold[sk])
+                else:
+                    mv = master_js.get(sk)
+                    out[sk] = float(mv) if isinstance(mv, (int, float)) else 0.0
+            return out
+        return apply_motor_map(master_js, mapping, hold=hold)
 
     def pause(self) -> None:
         """Emergency stop: stop sending commands to the slave so it holds at
         the last commanded pose. Master is still polled so we can resume into
         the operator's current pose, but its motion is not broadcast.
-        Discards any in-progress record/playback.
+        Discards any in-progress record/playback/calibration.
         """
         with self.lock:
             if self.mode == "paused":
                 return
+            was_cal = self.mode == "calibrate"
+            if was_cal:
+                m_r, s_r, saved_at = load_calibration(self._calibration_path)
+                self.cal_master_ranges = m_r
+                self.cal_slave_ranges = s_r
+                self.cal_saved_at = saved_at
+                self._calibrating = False
+                log.warning("Calibration aborted by pause")
             self._stop_active_locked()
-            self.mode = "paused"
-            log.warning("Paused (slave holding at last pose)")
+            self._clear_mmap_blend()
+            # Aborting calibrate → idle (no pose snap). Else pause holds last cmd.
+            self.mode = "idle" if was_cal else "paused"
+            log.warning("Mode after pause request: %s", self.mode)
+        if was_cal:
+            for slave in self.slaves:
+                try:
+                    if hasattr(slave, "disable_all"):
+                        slave.disable_all()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("disable_all after calibrate abort: %s", e)
+
+    def start_free_move(self) -> None:
+        """Stop teleop and unlock follower motors for hand-guiding (no damping)."""
+        with self.lock:
+            if self.mode == "free_move":
+                return
+            if self.mode == "calibrate":
+                raise ControllerError("校准中请先完成或取消校准")
+            self._stop_active_locked()
+            self._clear_mmap_blend()
+            self._calibrating = False
+            self.mode = "free_move"
+            self.last_error = None
+            log.warning("Free-move: teleop stopped, unlocking motors")
+
+        for slave in self.slaves:
+            try:
+                if hasattr(slave, "enter_free_move"):
+                    slave.enter_free_move()
+                elif hasattr(slave, "disable_all"):
+                    slave.disable_all()
+            except Exception as e:  # noqa: BLE001
+                log.warning("enter_free_move on start_free_move: %s", e)
 
     def resume(self) -> None:
-        """Leave paused mode by slow-blending the slave from its held pose to
-        the live master pose, then dropping to follow.
+        """Leave paused/idle/free_move and return to teleop.
+
+        After motor protection + power cycle the follower is often disabled and
+        its encoder frame no longer matches ``last_output``. Resume therefore:
+          1) parks the control loop (so free_move won't keep disabling J1)
+          2) re-handshakes / enables all slave motors
+          3) rebases software pose to measured encoders
+          4) soft-blends in slave space toward the live mapped master pose
+          5) enters follow
         """
+        if not self.arms_ready():
+            raise ControllerError("机械臂未就绪，请等待串口恢复后再解锁")
         with self.lock:
-            if self.mode != "paused":
+            if self.mode == "idle":
+                if not calibration_ready(self.cal_master_ranges, self.cal_slave_ranges):
+                    raise ControllerError("需要先完成校准才能跟随")
+                from_idle = True
+                from_free_move = False
+            elif self.mode in ("paused", "free_move"):
+                if not calibration_ready(self.cal_master_ranges, self.cal_slave_ranges):
+                    self.mode = "idle"
+                    log.info("Resume blocked — no valid calibration")
+                    return
+                from_idle = False
+                from_free_move = self.mode == "free_move"
+                # CRITICAL: leave free_move BEFORE serial re-enable. The control
+                # loop's hold_free_move() periodically disable()s J1; racing that
+                # against recover/enable leaves J1 dead while other joints work.
+                self.mode = "paused"
+                self._clear_mmap_blend()
+            else:
                 return
-            self._begin_return_to_follow_locked()
-            log.info("Resumed (return_to_follow blending to master)")
+
+        if from_idle:
+            for slave in self.slaves:
+                try:
+                    if hasattr(slave, "enable_all"):
+                        slave.enable_all()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("enable_all on resume from idle: %s", e)
+            with self.lock:
+                self.mode = "follow"
+                self.last_error = None
+                self._arms_hint = None
+                self._rebase_teleop_baseline(self.last_joint_states)
+            log.info("Idle → follow (valid calibration)")
+            return
+
+        # ---- paused / free_move → re-enable + soft approach to mapped pose ----
+        log.warning(
+            "Resume: re-handshake motors then soft approach (from_free_move=%s)",
+            from_free_move,
+        )
+        for slave in self.slaves:
+            try:
+                # enable_all clears free-move flags and retries POS_VEL switch —
+                # preferred after free_move (J1 was force-disabled there).
+                if from_free_move and hasattr(slave, "enable_all"):
+                    slave.enable_all()
+                elif hasattr(slave, "recover"):
+                    slave.recover()
+                elif hasattr(slave, "enable_all"):
+                    slave.enable_all()
+            except Exception as e:  # noqa: BLE001
+                log.warning("resume handshake failed: %s", e)
+
+        measured: dict = {}
+        for _attempt in range(5):
+            for slave in self.slaves:
+                try:
+                    if hasattr(slave, "poll_measured_joint_states"):
+                        m = slave.poll_measured_joint_states() or {}
+                    elif hasattr(slave, "get_measured_joint_states"):
+                        m = slave.get_measured_joint_states() or {}
+                    else:
+                        m = {}
+                    if m and any(isinstance(v, (int, float)) for v in m.values()):
+                        measured = m
+                        break
+                except Exception as e:  # noqa: BLE001
+                    log.warning("resume measured poll failed: %s", e)
+            if measured:
+                break
+            time.sleep(0.05)
+
+        master_js: Optional[dict] = None
+        if self.master:
+            try:
+                master_js = self.master.get_fashionstar_joint_states()
+            except Exception as e:  # noqa: BLE001
+                log.warning("resume master poll failed: %s", e)
+
+        with self.lock:
+            if master_js:
+                self.last_joint_states = deepcopy(master_js)
+            else:
+                master_js = (
+                    deepcopy(self.last_joint_states)
+                    if self.last_joint_states
+                    else None
+                )
+
+            if measured:
+                self.last_measured_joint_states = deepcopy(measured)
+                self.last_output_joint_states = deepcopy(measured)
+            from_js = deepcopy(
+                self.last_output_joint_states
+                or self.last_measured_joint_states
+                or {}
+            )
+            target = (
+                self._map_for_slave(master_js) if master_js else deepcopy(from_js)
+            )
+            self._stop_active_locked()
+            self._clear_mmap_blend()
+            if from_js and target and self._joint_delta(from_js, target) > 1e-3:
+                self._mmap_blend_start = time.monotonic()
+                self._mmap_blend_from = from_js
+                log.info(
+                    "Resume soft approach over %.1fs (maxΔ=%.3f rad)",
+                    self.cfg.return_time_s,
+                    self._joint_delta(from_js, target),
+                )
+            self.mode = "follow"
+            self.last_error = None
+            self._arms_hint = None
+            self._rebase_teleop_baseline(master_js)
+            log.info("→ follow (motors re-enabled after free_move/paused)")
 
     def set_safety(self, enabled: bool) -> None:
         with self.lock:
@@ -744,6 +1769,7 @@ class Controller:
         self.transition_to_js = None
         self.transition_target_action = None
         self.transition_target_mode = None
+        self._clear_mmap_blend()
         self.return_start_time = None
         self.return_from_js = None
 
@@ -757,8 +1783,13 @@ class Controller:
                  action.id, action.name, action.duration_s, mode)
 
     def _begin_return_to_follow_locked(self) -> None:
+        # Blend in MASTER space toward live master (never mix mapped last_output).
         self.return_start_time = time.monotonic()
-        self.return_from_js = self._current_output_js() or {}
+        self.return_from_js = deepcopy(
+            self.last_safety_joint_states
+            or self.last_joint_states
+            or {}
+        )
         self.current_action = None
         self.current_play_mode = None
         self.play_start_time = None
@@ -885,6 +1916,7 @@ class Controller:
             if alpha >= 1.0:
                 self._stop_active_locked()
                 self.mode = "follow"
+                self._rebase_teleop_baseline(master_js)
                 return master_js
             return self._blend(self.return_from_js or master_js, master_js, smooth)
 
@@ -896,6 +1928,16 @@ class Controller:
             recording_frames = (
                 len(self.record_buffer) if self.mode == "record" else None
             )
+            master_js = (
+                dict(self.last_joint_states) if self.last_joint_states else {}
+            )
+            # During calibrate / free_move there is no slave command — show live master.
+            if self.mode in ("calibrate", "free_move"):
+                cmd_or_master = master_js
+            elif self.last_output_joint_states:
+                cmd_or_master = dict(self.last_output_joint_states)
+            else:
+                cmd_or_master = master_js
             return {
                 "ts": time.time(),
                 "mode": self.mode,
@@ -911,11 +1953,31 @@ class Controller:
                 ),
                 "frame_count": self.frame_count,
                 "recording_frames": recording_frames,
-                "joint_states": (
-                    dict(self.last_output_joint_states) if self.last_output_joint_states
-                    else (dict(self.last_joint_states) if self.last_joint_states else {})
+                "joint_states": cmd_or_master,
+                "master_joint_states": master_js,
+                "slave_joint_states": (
+                    dict(self.last_measured_joint_states)
+                    if self.last_measured_joint_states
+                    else {}
                 ),
+                "calibration": ranges_payload(
+                    self.cal_master_ranges,
+                    self.cal_slave_ranges,
+                    active=self.mode == "calibrate",
+                    saved_at=self.cal_saved_at,
+                    mapping_enabled=self._calibration_mapping_enabled(),
+                ),
+                "motor_map": {
+                    k: self.motor_map.get(k) for k in MOTOR_MAP_KEYS
+                },
+                "motor_map_blending": self._mmap_blend_start is not None,
                 "last_error": self.last_error,
+                "arms": {
+                    "master": dict(self._arm_status["master"]),
+                    "slave": dict(self._arm_status["slave"]),
+                    "ready": self.arms_ready(),
+                    "hint": self._arms_hint,
+                },
             }
 
     # ------------------------------------------------------------------
@@ -928,33 +1990,172 @@ class Controller:
 
         log.info("Control loop @ %dHz starting", self.cfg.update_rate_hz)
         try:
+            last_probe = 0.0
+            probe_interval = 0.8
             while self.running:
                 loop_start = time.monotonic()
                 try:
+                    # Active probe even when paused (USB/power loss otherwise silent).
+                    now = time.monotonic()
+                    if self.arms_ready() and (now - last_probe) >= probe_interval:
+                        last_probe = now
+                        if self._probe_links() is not None:
+                            continue
+
+                    # Keep HTTP/WS alive across USB unplug: reconnect instead of exit.
+                    if not self.arms_ready():
+                        self._try_reconnect()
+                        now = time.monotonic()
+                        if now - last_push >= push_interval:
+                            last_push = now
+                            snap = self.snapshot()
+                            for fn in self._listeners:
+                                try:
+                                    fn(snap)
+                                except Exception as e:  # noqa: BLE001
+                                    log.debug("listener error: %s", e)
+                        time.sleep(update_interval)
+                        continue
+
                     with self.lock:
                         mode = self.mode
 
                     out_js: Optional[dict] = None
 
                     if mode in ("follow", "record"):
-                        js = self.master.get_fashionstar_joint_states() if self.master else None
+                        try:
+                            js = (
+                                self.master.get_fashionstar_joint_states()
+                                if self.master
+                                else None
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            if self._is_link_error(e):
+                                self._enter_link_fault("master", e)
+                                continue
+                            raise
                         if js:
                             self.last_joint_states = deepcopy(js)
-                            send_js = (
-                                self._apply_safety(js, update_interval)
-                                if self.safety_enabled else js
-                            )
-                            if send_js is None:
-                                # Spike detected: hold slave, surface to UI.
-                                self.last_error = "safety: spike on master input"
-                                self.pause()
-                            else:
-                                self._broadcast_to_slaves(send_js)
-                                out_js = send_js
-                                if mode == "record":
-                                    self._update_recording(send_js)
+                            # Block teleop until a valid calibration exists.
+                            if not self._calibration_mapping_enabled():
+                                if self.mode == "follow":
+                                    with self.lock:
+                                        if self.mode == "follow" and not self._calibration_mapping_enabled():
+                                            self.mode = "idle"
                                 self.frame_count += 1
+                            else:
+                                send_js = (
+                                    self._apply_safety(js, update_interval)
+                                    if self.safety_enabled else js
+                                )
+                                if send_js is None:
+                                    self.last_error = "safety: spike on master input"
+                                    self.pause()
+                                else:
+                                    mapped = self._apply_mmap_blend(
+                                        self._map_for_slave(send_js)
+                                    )
+                                    self._broadcast_to_slaves(mapped)
+                                    out_js = mapped
+                                    if mode == "record":
+                                        self._update_recording(send_js)
+                                    self.frame_count += 1
+                    elif mode == "idle":
+                        # UI telemetry only — never command follower.
+                        try:
+                            js = (
+                                self.master.get_fashionstar_joint_states()
+                                if self.master
+                                else None
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            if self._is_link_error(e):
+                                self._enter_link_fault("master", e)
+                                continue
+                            raise
+                        if js:
+                            self.last_joint_states = deepcopy(js)
+                            self.frame_count += 1
+                    elif mode == "free_move":
+                        # Unlock motors: MIT zero / disable, no teleop broadcast.
+                        try:
+                            js = (
+                                self.master.get_fashionstar_joint_states()
+                                if self.master
+                                else None
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            if self._is_link_error(e):
+                                self._enter_link_fault("master", e)
+                                continue
+                            raise
+                        if js:
+                            self.last_joint_states = deepcopy(js)
+                            self.frame_count += 1
+                        link_fault = False
+                        for slave in self.slaves:
+                            try:
+                                if hasattr(slave, "hold_free_move"):
+                                    m = slave.hold_free_move()
+                                    if m:
+                                        self.last_measured_joint_states = deepcopy(m)
+                                        break
+                                else:
+                                    self._cache_measured_from_slaves(poll=True)
+                                    break
+                            except Exception as e:  # noqa: BLE001
+                                if self._is_link_error(e):
+                                    self._enter_link_fault("slave", e)
+                                    link_fault = True
+                                    break
+                                log.debug("hold_free_move: %s", e)
+                        if link_fault:
+                            continue
+                    elif mode == "calibrate":
+                        # Free-move: keep follower at MIT zero torque; read both sides
+                        # and expand min/max for later range mapping.
+                        try:
+                            js = (
+                                self.master.get_fashionstar_joint_states()
+                                if self.master
+                                else None
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            if self._is_link_error(e):
+                                self._enter_link_fault("master", e)
+                                continue
+                            raise
+                        if js:
+                            self.last_joint_states = deepcopy(js)
+                            expand_ranges(self.cal_master_ranges, js)
+                            self.frame_count += 1
+                        # Continuous zero-torque frames (also refresh encoders).
+                        link_fault = False
+                        for slave in self.slaves:
+                            try:
+                                if hasattr(slave, "hold_free_move"):
+                                    m = slave.hold_free_move()
+                                    if m:
+                                        self.last_measured_joint_states = deepcopy(m)
+                                        break
+                                else:
+                                    self._cache_measured_from_slaves(poll=True)
+                                    break
+                            except Exception as e:  # noqa: BLE001
+                                if self._is_link_error(e):
+                                    self._enter_link_fault("slave", e)
+                                    link_fault = True
+                                    break
+                                log.debug("hold_free_move: %s", e)
+                        if link_fault:
+                            continue
+                        expand_ranges(
+                            self.cal_slave_ranges,
+                            self.last_measured_joint_states,
+                        )
                     elif mode == "transition":
+                        # Blend endpoints are already in slave/hardware space
+                        # (see start_playback). Do NOT run _map_for_slave again.
                         js = self._update_transition()
                         if js:
                             self._broadcast_to_slaves(js)
@@ -963,13 +2164,13 @@ class Controller:
                     elif mode == "playback":
                         js = self._update_playback()
                         if js:
-                            self._broadcast_to_slaves(js)
+                            self._broadcast_to_slaves(self._map_for_slave(js))
                             out_js = js
                             self.frame_count += 1
                     elif mode == "return_to_follow":
                         js = self._update_return_to_follow()
                         if js:
-                            self._broadcast_to_slaves(js)
+                            self._broadcast_to_slaves(self._map_for_slave(js))
                             out_js = js
                             self.frame_count += 1
                     elif mode == "paused":
@@ -983,6 +2184,11 @@ class Controller:
                     now = time.monotonic()
                     if now - last_push >= push_interval:
                         last_push = now
+                        if mode not in ("calibrate", "free_move"):
+                            # Always poll encoders for UI (POS_VEL feedback can miss
+                            # under burst writes; refresh is the reliable read).
+                            self._cache_measured_from_slaves(poll=True)
+                        # calibrate: ranges already expanded each tick via hold_free_move
                         snap = self.snapshot()
                         for fn in self._listeners:
                             try:
@@ -996,15 +2202,11 @@ class Controller:
                 except KeyboardInterrupt:
                     log.info("Control loop interrupted")
                     break
-                except serial.SerialException as e:
-                    log.error("Serial connection lost: %s", e)
-                    self.last_error = f"serial: {e}"
-                    break
-                except OSError as e:
-                    log.error("OS error: %s", e)
-                    self.last_error = f"os: {e}"
-                    break
                 except Exception as e:  # noqa: BLE001
+                    if self._is_link_error(e):
+                        # Attribute unknown link loss to both arms and reconnect.
+                        self._enter_link_fault("both", e)
+                        continue
                     log.exception("Unexpected error in control loop")
                     self.last_error = str(e)
                     time.sleep(0.5)

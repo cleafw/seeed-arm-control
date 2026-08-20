@@ -1,4 +1,4 @@
-import type { ActionMeta, PlayMode } from "./types";
+import type { ActionMeta, MotorMapEntry, PlayMode } from "./types";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -29,6 +29,7 @@ export const api = {
   stopPlay: () => req("/api/actions/stop", { method: "POST" }),
   follow: () => req("/api/follow", { method: "POST" }),
   pause: () => req("/api/pause", { method: "POST" }),
+  freeMove: () => req("/api/free_move", { method: "POST" }),
   resume: () => req("/api/resume", { method: "POST" }),
   setSafety: (enabled: boolean) =>
     req("/api/safety", {
@@ -36,6 +37,14 @@ export const api = {
       body: JSON.stringify({ enabled }),
     }),
   recover: () => req("/api/recover", { method: "POST" }),
+  startCalibrate: () => req("/api/calibrate/start", { method: "POST" }),
+  finishCalibrate: () => req("/api/calibrate/finish", { method: "POST" }),
+  cancelCalibrate: () => req("/api/calibrate/cancel", { method: "POST" }),
+  setMotorMap: (map: Record<string, MotorMapEntry>) =>
+    req("/api/motor_map", {
+      method: "POST",
+      body: JSON.stringify({ map }),
+    }),
   rename: (id: string, name: string) =>
     req<ActionMeta>(`/api/actions/${id}`, {
       method: "PATCH",

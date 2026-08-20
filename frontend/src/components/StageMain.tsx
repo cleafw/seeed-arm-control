@@ -30,6 +30,54 @@ export function StageMain({
     return <FollowStage actions={actions} playDisabled={playDisabled} onChange={onChange} onOpenPicker={onOpenPicker} />;
   }
 
+  if (snapshot.mode === "idle") {
+    return (
+      <div className="stage-panel stage-panel--center">
+        <div className="mode-indicator">
+          <div className="mode-indicator__title" style={{ color: "var(--accent-trans)" }}>
+            待校准
+          </div>
+          <div className="mode-indicator__subtitle">
+            从臂不会跟随主臂。请先完成中间栏「关节校准」，完成后再开始遥操。
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (snapshot.mode === "free_move") {
+    return (
+      <div className="stage-panel stage-panel--center">
+        <div className="paused-stage">
+          <div className="paused-stage__title" style={{ color: "var(--accent-free)" }}>
+            已停止运行
+          </div>
+          <div className="paused-stage__hint">
+            所有电机已解锁，可自由拖动（无阻尼）。主臂活动不会被传递。
+            <br />
+            准备好后点击 <b>恢复跟随</b>，从臂会缓慢移动到映射位姿后继续遥操。
+          </div>
+          <div className="paused-stage__actions">
+            <button
+              type="button"
+              className="paused-stage__resume"
+              onClick={async () => {
+                try {
+                  await api.resume();
+                  toast.push("ok", "正在缓移到跟随位姿");
+                } catch (e) {
+                  toast.push("err", `${e instanceof Error ? e.message : String(e)}`);
+                }
+              }}
+            >
+              ▶ 恢复跟随
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   if (snapshot.mode === "record") {
     return (
       <div className="stage-panel stage-panel--center">
@@ -160,7 +208,9 @@ export function StageMain({
               <>
                 从臂正保持在当前位姿，主臂的活动不会被传递。
                 <br />
-                如果某根电机线刚被插回，请先点 <b>复位</b>；之后再按 <b>解除锁定</b>。
+                电机保护 / 重新上电后，直接点 <b>解除锁定</b>：会重新使能电机，并缓慢移动到跟随位姿。
+                <br />
+                若单根电机线刚重插仍无响应，可先点 <b>复位</b> 再解除锁定。
               </>
             )}
           </div>
@@ -171,7 +221,7 @@ export function StageMain({
               onClick={async () => {
                 try {
                   await api.resume();
-                  toast.push("ok", recovering ? "复位已中止" : "已恢复跟随");
+                  toast.push("ok", recovering ? "复位已中止，正在缓移回跟随" : "正在缓移到跟随位姿");
                 } catch (e) {
                   toast.push("err", `${e instanceof Error ? e.message : String(e)}`);
                 }
@@ -279,7 +329,7 @@ function FollowStage({
           </button>
         </div>
         <div className="follow-hero__hint">
-          点击开始录制后，从臂会持续跟随主臂，并把整段动作存进右侧动作库。
+          点击开始录制后，从臂会持续跟随主臂，并把整段动作存进下方动作库。
           录完按红色停止键即可。
         </div>
       </div>

@@ -25,6 +25,7 @@ from .models import (
     ActionMeta,
     ActionPatch,
     HealthResponse,
+    MotorMapRequest,
     PlayRequest,
     RecordStartRequest,
     SafetyRequest,
@@ -94,9 +95,9 @@ def build_app() -> FastAPI:
         loop = asyncio.get_running_loop()
         hub.attach_loop(loop)
 
-        # Hardware setup happens in the control thread so failures don't
-        # take down the HTTP server immediately — but the thread will exit
-        # on serial errors and the process should exit too.
+        # Hardware setup + reconnect live in the control thread. Serial I/O
+        # faults no longer kill the loop — only unexpected crashes exit, and
+        # then we SIGTERM so Docker can restart the container.
         def thread_target():
             try:
                 controller.setup_hardware()
@@ -104,8 +105,6 @@ def build_app() -> FastAPI:
             except Exception:  # noqa: BLE001
                 log.exception("Control thread crashed")
             finally:
-                # Make sure the process exits when the control thread dies,
-                # so the container restart policy can recover us.
                 log.info("Control thread done; signaling shutdown")
                 os.kill(os.getpid(), signal.SIGTERM)
 
@@ -136,8 +135,8 @@ def build_app() -> FastAPI:
         return HealthResponse(
             ok=controller.running,
             mode=controller.mode,
-            master_connected=controller.master is not None,
-            slave_connected=bool(controller.slaves),
+            master_connected=controller.arm_connected("master"),
+            slave_connected=controller.arm_connected("slave"),
         )
 
     @app.get("/api/state", response_model=StateSnapshot)
@@ -189,9 +188,20 @@ def build_app() -> FastAPI:
         controller.pause()
         return StateSnapshot(**controller.snapshot())
 
+    @app.post("/api/free_move", response_model=StateSnapshot)
+    async def free_move():
+        try:
+            await run_in_threadpool(controller.start_free_move)
+        except ControllerError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        return StateSnapshot(**controller.snapshot())
+
     @app.post("/api/resume", response_model=StateSnapshot)
     async def resume():
-        controller.resume()
+        try:
+            await run_in_threadpool(controller.resume)
+        except ControllerError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
         return StateSnapshot(**controller.snapshot())
 
     @app.post("/api/safety", response_model=StateSnapshot)
@@ -206,24 +216,65 @@ def build_app() -> FastAPI:
         snap = await run_in_threadpool(controller.recover)
         return StateSnapshot(**snap)
 
+    @app.post("/api/calibrate/start", response_model=StateSnapshot)
+    async def calibrate_start():
+        try:
+            await run_in_threadpool(controller.start_calibrate)
+        except ControllerError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        return StateSnapshot(**controller.snapshot())
+
+    @app.post("/api/calibrate/finish", response_model=StateSnapshot)
+    async def calibrate_finish():
+        try:
+            await run_in_threadpool(controller.finish_calibrate)
+        except ControllerError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        return StateSnapshot(**controller.snapshot())
+
+    @app.post("/api/calibrate/cancel", response_model=StateSnapshot)
+    async def calibrate_cancel():
+        try:
+            await run_in_threadpool(controller.cancel_calibrate)
+        except ControllerError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        return StateSnapshot(**controller.snapshot())
+
+    @app.post("/api/motor_map", response_model=StateSnapshot)
+    async def set_motor_map(req: MotorMapRequest):
+        controller.set_motor_map(req.map)
+        return StateSnapshot(**controller.snapshot())
+
     @app.get("/api/debug/slave")
     async def debug_slave():
         out = []
         for slave in controller.slaves:
+            # Prefer a live refresh so the debug endpoint matches the UI bars.
+            try:
+                if hasattr(slave, "poll_measured_joint_states"):
+                    measured = slave.poll_measured_joint_states() or {}
+                elif hasattr(slave, "get_measured_joint_states"):
+                    measured = slave.get_measured_joint_states() or {}
+                else:
+                    measured = {}
+            except Exception:  # noqa: BLE001
+                measured = {}
             motors = []
             for i, m in enumerate(getattr(slave, "motors", []) or []):
                 def _f(x):
                     return float(x) if x is not None else None
+                key = f"joint{i+1}" if i < 6 else "gripper"
                 motors.append({
                     "idx": i,
                     "slave_id": getattr(m, "SlaveID", None),
-                    "measured_pos": _f(getattr(m, "state_q", None)),
+                    "measured_pos": measured.get(key, _f(getattr(m, "state_q", None))),
                     "measured_tau": _f(getattr(m, "state_tau", None)),
                 })
             out.append({"motors": motors})
         return {
             "commanded": controller.last_output_joint_states,
             "master_last": controller.last_joint_states,
+            "measured": controller.last_measured_joint_states,
             "slaves": out,
         }
 

@@ -7,6 +7,7 @@ import { StatusBanner } from "./components/StatusBanner";
 import { JointPanel } from "./components/JointPanel";
 import { StageMain } from "./components/StageMain";
 import { StatusFoot } from "./components/StatusFoot";
+import { CalibratePanel } from "./components/CalibratePanel";
 import { ActionPicker } from "./components/ActionPicker";
 
 export default function App() {
@@ -34,10 +35,19 @@ function AppInner() {
     }
   }, [toast]);
 
+  const handleFreeMove = useCallback(async () => {
+    try {
+      await api.freeMove();
+      toast.push("info", "已停止运行 — 电机已解锁，可自由拖动");
+    } catch (e) {
+      toast.push("err", `停止失败：${e instanceof Error ? e.message : String(e)}`);
+    }
+  }, [toast]);
+
   const handleResume = useCallback(async () => {
     try {
       await api.resume();
-      toast.push("ok", "已恢复跟随");
+      toast.push("ok", "正在重新使能并缓移到跟随位姿");
     } catch (e) {
       toast.push("err", `恢复失败：${e instanceof Error ? e.message : String(e)}`);
     }
@@ -66,8 +76,25 @@ function AppInner() {
     }
   }, [snapshot, refresh]);
 
-  const mode = snapshot?.mode ?? "follow";
-  // Picker can keep playing other actions only when the controller is idle.
+  // First-run prompt: no valid calibration saved yet.
+  const calPromptedRef = useRef(false);
+  useEffect(() => {
+    if (!connected || !snapshot || calPromptedRef.current) return;
+    const cal = snapshot.calibration;
+    if (cal?.mapping_enabled) return;
+    if (snapshot.mode === "calibrate") return;
+    calPromptedRef.current = true;
+    toast.push("warn", "首次运行需要先校准：请在中间栏点击「开始校准」");
+  }, [connected, snapshot, toast]);
+
+  const needsCalibration =
+    connected &&
+    snapshot != null &&
+    snapshot.mode !== "calibrate" &&
+    !snapshot.calibration?.mapping_enabled;
+
+  const mode = snapshot?.mode ?? "idle";
+  // Picker / record only when idle follow (not calibrating).
   const playDisabled = mode !== "follow";
 
   return (
@@ -90,21 +117,51 @@ function AppInner() {
           actions={actions}
           onPause={handlePause}
           onResume={handleResume}
+          onFreeMove={handleFreeMove}
         />
-        {error && (
-          <div className="error-banner">
-            <span>{error}</span>
-            <button
-              type="button"
-              className="error-banner__close"
-              onClick={() => setError(null)}
-              aria-label="关闭"
-            >
-              ✕
-            </button>
+        {(error || needsCalibration) && (
+          <div className="notice-stack">
+            {error && (
+              <div className="error-banner">
+                <span>{error}</span>
+                <button
+                  type="button"
+                  className="error-banner__close"
+                  onClick={() => setError(null)}
+                  aria-label="关闭"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+            {needsCalibration && (
+              <div className="cal-needed-banner" role="status">
+                首次运行需要先校准 — 请在中间「关节校准」栏点击「开始校准」，分别扫满主臂与从臂行程后再完成。
+              </div>
+            )}
           </div>
         )}
-        <JointPanel joints={snapshot?.joint_states} mode={mode} />
+        <JointPanel
+          joints={
+            mode === "calibrate" || mode === "free_move"
+              ? (snapshot?.master_joint_states ?? snapshot?.joint_states)
+              : snapshot?.joint_states
+          }
+          slaveJoints={snapshot?.slave_joint_states}
+          mode={mode}
+          masterLabel={mode === "calibrate" || mode === "free_move"}
+          motorMap={snapshot?.motor_map}
+          motorMapBlending={snapshot?.motor_map_blending}
+          onMotorMapChange={refresh}
+          onMotorMapSaved={() =>
+            toast.push("ok", "电机映射已永久保存（重启后仍有效）")
+          }
+          onMotorMapError={(msg) => toast.push("err", `电机映射失败：${msg}`)}
+        />
+        <CalibratePanel
+          snapshot={snapshot}
+          onToast={(kind, msg) => toast.push(kind, msg)}
+        />
         <main className="main-stage">
           {snapshot ? (
             <StageMain
