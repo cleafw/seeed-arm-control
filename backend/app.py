@@ -24,13 +24,16 @@ from .controller import Controller, ControllerError
 from .models import (
     ActionMeta,
     ActionPatch,
+    ArmProfileInfo,
     HealthResponse,
     MotorMapRequest,
     PlayRequest,
+    ProfileSelectRequest,
     RecordStartRequest,
     SafetyRequest,
     StateSnapshot,
 )
+from .profiles import list_followers, list_leaders, list_profiles
 from .storage import ActionLibrary
 
 log = logging.getLogger(__name__)
@@ -137,11 +140,41 @@ def build_app() -> FastAPI:
             mode=controller.mode,
             master_connected=controller.arm_connected("master"),
             slave_connected=controller.arm_connected("slave"),
+            **controller.profile_snapshot_fields(),
         )
 
     @app.get("/api/state", response_model=StateSnapshot)
     async def state():
         return StateSnapshot(**controller.snapshot())
+
+    @app.get("/api/profiles", response_model=list[ArmProfileInfo])
+    async def profiles(role: str | None = None):
+        """List registered arm profiles (optional role=leader|follower)."""
+        if role is None:
+            items = list_profiles()
+        elif role == "leader":
+            items = list_leaders()
+        elif role == "follower":
+            items = list_followers()
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="role must be 'leader', 'follower', or omitted",
+            )
+        return [ArmProfileInfo(**p.to_dict()) for p in items]
+
+    @app.post("/api/profiles/select", response_model=StateSnapshot)
+    async def select_profiles(req: ProfileSelectRequest):
+        """Manually select leader/follower and persist to active_profiles.json."""
+        try:
+            snap = await run_in_threadpool(
+                controller.set_profiles,
+                req.leader_profile,
+                req.follower_profile,
+            )
+        except ControllerError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        return StateSnapshot(**snap)
 
     @app.get("/api/actions", response_model=list[ActionMeta])
     async def list_actions():

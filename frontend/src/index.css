@@ -381,12 +381,101 @@ input {
     font-size: 10px;
   }
 
-  /* ── Middle: joint calibration ─────────────────────── */
-  .cal-panel {
+  /* ── Middle column: arm select + calibration ───────── */
+  .mid-stack {
     grid-column: 2;
     grid-row: 3;
-    border-top: none;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
     border-right: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  .arm-select-panel {
+    flex-shrink: 0;
+    padding: 14px 16px 12px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .arm-select-panel__header {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--text-faint);
+  }
+  .arm-select-panel__field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .arm-select-panel__field select {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text);
+  }
+  .arm-select-panel__field select:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .arm-select-panel__meta {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .arm-select-panel__pair {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-faint);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .arm-select-panel__hint {
+    font-size: 10px;
+    color: var(--text-faint);
+  }
+  .arm-select-panel__hint--err {
+    color: var(--accent-rec);
+  }
+  .arm-select-panel__save {
+    align-self: stretch;
+    margin-top: 2px;
+    padding: 6px 10px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+  }
+  .arm-select-panel__save:hover:not(:disabled) {
+    border-color: var(--text-dim);
+  }
+  .arm-select-panel__save:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  /* ── Middle: joint calibration ─────────────────────── */
+  .cal-panel {
+    grid-column: unset;
+    grid-row: unset;
+    border-top: none;
+    border-right: none;
     border-bottom: none;
     padding: 16px 18px 18px;
     display: flex;
@@ -395,6 +484,7 @@ input {
     min-width: 0;
     min-height: 0;
     overflow-y: auto;
+    flex: 1;
     background: var(--surface);
   }
   .cal-panel--active {
@@ -1299,12 +1389,12 @@ input {
     max-height: 48vh;
     overflow-y: auto;
   }
-  .cal-panel {
+  .mid-stack {
     grid-column: 1;
     grid-row: 4;
     border-right: none;
     border-bottom: 1px solid var(--border);
-    max-height: 40vh;
+    max-height: 48vh;
   }
   .main-stage {
     grid-column: 1;

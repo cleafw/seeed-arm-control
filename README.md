@@ -1,13 +1,14 @@
-# rebot-record
+# seeed-arm-control
 
 > **文档**：[`SKILL.md`](./SKILL.md)　[`docs/功能说明.md`](./docs/功能说明.md)　[`docs/来源.md`](./docs/来源.md)　[`docs/变更记录.md`](./docs/变更记录.md)  
-> **上游基准**：https://github.com/Love4yzp/rebot-b601-102-record-demo （`fee8dfd`）
+> **上游基准**：https://github.com/Love4yzp/rebot-b601-102-record-demo （`fee8dfd`）  
+> **原目录名**：`rebot-b601-102-record`
 
-主臂（StarAi Violin / Arm-102）→ 从臂（reBot B601-DM）遥操、录制、回放的常驻服务。
+主臂（StarAi Violin / Arm-102）→ 从臂（reBot B601-DM）遥操、录制、回放的常驻服务（正演进为可插拔臂型的通用控制台）。
 浏览器即客户端：装好之后，机器人主机开机自启，运维人员从局域网内任何电脑打开网页就能用。
 
 > **Linux + Docker**。Web UI 跨平台（任何浏览器）。  
-> Docker 部署对外端口 **1882**（`1882:8000`）；容器内 / 本机 `uvicorn` 仍是 **8000**。
+> Docker 部署对外端口 **1882**（`1882:8000`）；容器内 / 本机 `uvicorn` 仍是 **8000**。本地验收：`start-local.bat` → http://localhost:5173
 
 ---
 

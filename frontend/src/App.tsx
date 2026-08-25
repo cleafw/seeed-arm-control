@@ -8,6 +8,7 @@ import { JointPanel } from "./components/JointPanel";
 import { StageMain } from "./components/StageMain";
 import { StatusFoot } from "./components/StatusFoot";
 import { CalibratePanel } from "./components/CalibratePanel";
+import { ArmSelectPanel } from "./components/ArmSelectPanel";
 import { ActionPicker } from "./components/ActionPicker";
 
 export default function App() {
@@ -158,10 +159,16 @@ function AppInner() {
           }
           onMotorMapError={(msg) => toast.push("err", `电机映射失败：${msg}`)}
         />
-        <CalibratePanel
-          snapshot={snapshot}
-          onToast={(kind, msg) => toast.push(kind, msg)}
-        />
+        <div className="mid-stack">
+          <ArmSelectPanel
+            snapshot={snapshot}
+            onToast={(kind, msg) => toast.push(kind, msg)}
+          />
+          <CalibratePanel
+            snapshot={snapshot}
+            onToast={(kind, msg) => toast.push(kind, msg)}
+          />
+        </div>
         <main className="main-stage">
           {snapshot ? (
             <StageMain

@@ -95,6 +95,29 @@ class HealthResponse(BaseModel):
     mode: ControllerMode
     master_connected: bool
     slave_connected: bool
+    leader_profile: Optional[str] = None
+    follower_profile: Optional[str] = None
+    pair_id: Optional[str] = None
+
+
+class ArmProfileInfo(BaseModel):
+    """Registered arm model (from backend.profiles)."""
+    id: str
+    role: Literal["leader", "follower"]
+    label: str
+    label_zh: str
+    description: str = ""
+    default_baudrate: Optional[int] = None
+    capabilities: list[str] = Field(default_factory=list)
+    usb_hints: list[dict] = Field(default_factory=list)
+    has_detector: bool = False
+    has_driver_factory: bool = False
+
+
+class ProfileSelectRequest(BaseModel):
+    """Manual leader/follower selection (phase 1.3)."""
+    leader_profile: str
+    follower_profile: str
 
 
 class StateSnapshot(BaseModel):
@@ -114,6 +137,10 @@ class StateSnapshot(BaseModel):
     motor_map_blending: bool = False
     last_error: Optional[str] = None
     arms: dict = Field(default_factory=dict)
+    # Active arm pairing (phase 1.2); ids match backend.profiles
+    leader_profile: Optional[str] = None
+    follower_profile: Optional[str] = None
+    pair_id: Optional[str] = None
 
 
 class MotorMapRequest(BaseModel):

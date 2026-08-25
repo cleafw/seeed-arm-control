@@ -53,6 +53,21 @@ export interface ArmsInfo {
   hint: string | null;
 }
 
+export type ArmRole = "leader" | "follower";
+
+export interface ArmProfileInfo {
+  id: string;
+  role: ArmRole;
+  label: string;
+  label_zh: string;
+  description: string;
+  default_baudrate: number | null;
+  capabilities: string[];
+  usb_hints: Record<string, unknown>[];
+  has_detector: boolean;
+  has_driver_factory: boolean;
+}
+
 export interface StateSnapshot {
   ts: number;
   mode: ControllerMode;
@@ -75,6 +90,12 @@ export interface StateSnapshot {
   last_error: string | null;
   /** Dual-arm USB/serial link status. */
   arms?: ArmsInfo;
+  /** Active registered leader profile id (e.g. violin_102). */
+  leader_profile?: string | null;
+  /** Active registered follower profile id (e.g. b601_dm). */
+  follower_profile?: string | null;
+  /** `{leader}__{follower}` pairing key. */
+  pair_id?: string | null;
 }
 
 export interface ActionMeta {

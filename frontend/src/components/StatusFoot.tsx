@@ -99,6 +99,11 @@ export function StatusFoot({ connected, snapshot }: Props) {
         <span className={`foot-bar__dot ${wsClass}`} />
         <span>{connected ? "服务已连接" : "服务重连中"}</span>
       </div>
+      {snapshot?.pair_id ? (
+        <div className="foot-bar__item" title="当前臂型配套">
+          {snapshot.pair_id}
+        </div>
+      ) : null}
       {snapshot ? (
         <div className="foot-bar__item">{snapshot.frame_count.toLocaleString()} ticks</div>
       ) : null}

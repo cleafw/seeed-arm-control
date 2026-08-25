@@ -1,4 +1,4 @@
-import type { ActionMeta, MotorMapEntry, PlayMode } from "./types";
+import type { ActionMeta, ArmProfileInfo, ArmRole, MotorMapEntry, PlayMode, StateSnapshot } from "./types";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -14,6 +14,10 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  listProfiles: (role?: ArmRole) =>
+    req<ArmProfileInfo[]>(
+      role ? `/api/profiles?role=${encodeURIComponent(role)}` : "/api/profiles",
+    ),
   listActions: () => req<ActionMeta[]>("/api/actions"),
   startRecord: (name?: string) =>
     req("/api/actions/record/start", {
@@ -44,6 +48,11 @@ export const api = {
     req("/api/motor_map", {
       method: "POST",
       body: JSON.stringify({ map }),
+    }),
+  selectProfiles: (leader_profile: string, follower_profile: string) =>
+    req<StateSnapshot>("/api/profiles/select", {
+      method: "POST",
+      body: JSON.stringify({ leader_profile, follower_profile }),
     }),
   rename: (id: string, name: string) =>
     req<ActionMeta>(`/api/actions/${id}`, {

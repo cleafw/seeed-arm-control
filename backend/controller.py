@@ -47,6 +47,8 @@ from .motor_map import (
     save_motor_map,
 )
 from .pipermate import PiPER_MateAgilex
+from .profiles import get_profile, load_active_profiles, pair_id as make_pair_id, save_active_profiles
+from .profiles.registry import ProfileError
 from .storage import ActionLibrary
 from .u2can.DM_CAN import (
     Control_Type,
@@ -623,6 +625,16 @@ class Controller:
         self._probe_fail_counts: dict[str, int] = {"master": 0, "slave": 0}
         self._probe_fail_limit: int = 2
 
+        # Active arm profiles (phase 1.2/1.3; UI select + persist)
+        self.leader_profile_id, self.follower_profile_id = self._boot_profile_ids(cfg)
+        self.pair_id = make_pair_id(self.leader_profile_id, self.follower_profile_id)
+        log.info(
+            "Active pairing: leader=%s follower=%s pair_id=%s",
+            self.leader_profile_id,
+            self.follower_profile_id,
+            self.pair_id,
+        )
+
         # Calibration ranges (live session + last saved)
         cal_path = self.cfg.recordings_dir / "calibration.json"
         self._calibration_path = cal_path
@@ -651,6 +663,88 @@ class Controller:
 
         # Snapshot listeners (e.g., WS broadcaster)
         self._listeners: list = []
+
+    # ------------------------------------------------------------------
+    # Arm profiles / pairing (phase 1.2 / 1.3)
+    # ------------------------------------------------------------------
+    def _boot_profile_ids(self, cfg: Config) -> tuple[str, str]:
+        """Prefer saved active_profiles.json, then env, then legacy defaults."""
+        saved = load_active_profiles(cfg.recordings_dir)
+        if saved is not None:
+            try:
+                return self._resolve_profile_ids(saved[0], saved[1])
+            except Exception as e:  # noqa: BLE001
+                log.warning("Ignoring saved active_profiles.json: %s", e)
+        return self._resolve_profile_ids(cfg.leader_profile, cfg.follower_profile)
+
+    @staticmethod
+    def _resolve_profile_ids(leader_id: str, follower_id: str) -> tuple[str, str]:
+        """Validate profile ids; fall back to legacy Violin + B601."""
+        default_leader, default_follower = "violin_102", "b601_dm"
+        try:
+            leader = get_profile(leader_id)
+            if leader.role != "leader":
+                raise ProfileError(f"{leader_id} is not a leader")
+        except ProfileError as e:
+            log.warning("Invalid LEADER_PROFILE=%r (%s); using %s", leader_id, e, default_leader)
+            leader_id = default_leader
+            get_profile(leader_id)
+        try:
+            follower = get_profile(follower_id)
+            if follower.role != "follower":
+                raise ProfileError(f"{follower_id} is not a follower")
+        except ProfileError as e:
+            log.warning(
+                "Invalid FOLLOWER_PROFILE=%r (%s); using %s",
+                follower_id,
+                e,
+                default_follower,
+            )
+            follower_id = default_follower
+            get_profile(follower_id)
+        return leader_id, follower_id
+
+    def profile_snapshot_fields(self) -> dict:
+        return {
+            "leader_profile": self.leader_profile_id,
+            "follower_profile": self.follower_profile_id,
+            "pair_id": self.pair_id,
+        }
+
+    def set_profiles(self, leader_id: str, follower_id: str) -> dict:
+        """Manually select leader/follower profiles and persist (phase 1.3).
+
+        Does not hot-swap drivers yet (phase 4). Switching while calibrating /
+        recording / playing is rejected.
+        """
+        with self.lock:
+            if self.mode in ("calibrate", "record", "transition", "playback", "return_to_follow"):
+                raise ControllerError(
+                    f"当前模式 {self.mode} 下不能切换臂型，请先停止录制/回放或结束校准"
+                )
+            leader_id, follower_id = self._resolve_profile_ids(leader_id, follower_id)
+            new_pair = make_pair_id(leader_id, follower_id)
+            changed = (
+                leader_id != self.leader_profile_id
+                or follower_id != self.follower_profile_id
+            )
+            self.leader_profile_id = leader_id
+            self.follower_profile_id = follower_id
+            self.pair_id = new_pair
+
+        try:
+            save_active_profiles(
+                self.cfg.recordings_dir,
+                leader_id,
+                follower_id,
+                pair_id=new_pair,
+            )
+        except OSError as e:
+            raise ControllerError(f"保存运行配置失败: {e}") from e
+
+        if changed:
+            log.info("Profiles updated → %s (persist ok)", new_pair)
+        return self.snapshot()
 
     # ------------------------------------------------------------------
     # Hardware setup / teardown / reconnect
@@ -1978,6 +2072,7 @@ class Controller:
                     "ready": self.arms_ready(),
                     "hint": self._arms_hint,
                 },
+                **self.profile_snapshot_fields(),
             }
 
     # ------------------------------------------------------------------

@@ -1,17 +1,20 @@
-# Project: rebot-b601-102-record
+# Project: seeed-arm-control
 
 ## 概述
 
-**StarAi Violin / Arm-102 主臂 → reBot B601-DM 从臂** 的遥操 / 录制 / 回放常驻服务。主臂驱动对齐 LeRobot `rebot_102_leader`（`motorbridge-smart-servo`）；从臂沿用本仓库 `u2can/DM_CAN`。
+**StarAi Violin / Arm-102 主臂 → reBot B601-DM 从臂** 的遥操 / 录制 / 回放常驻服务（可扩展其它臂型）。主臂驱动对齐 LeRobot `rebot_102_leader`（`motorbridge-smart-servo`）；从臂沿用本仓库 `u2can/DM_CAN`。
 
-在上游 `fee8dfd` 之上增加：关节校准、电机映射（含正反向）、停止运行/自由拖动、急停恢复、回放过渡修复、**双臂串口探活与就地重连**等。详见 [`docs/变更记录.md`](docs/变更记录.md)。
+> 原工程名：`rebot-b601-102-record`。产品目录现为 **seeed-arm-control**。
+
+在上游 `fee8dfd` 之上增加：关节校准、电机映射（含正反向）、停止运行/自由拖动、急停恢复、回放过渡修复、**双臂串口探活与就地重连**、臂型注册表等。详见 [`docs/变更记录.md`](docs/变更记录.md)。
 
 | 项 | 值 |
 |---|---|
+| 本仓库目录 | `seeed-arm-control` |
 | 上游 | https://github.com/Love4yzp/rebot-b601-102-record-demo |
 | 上游基准 commit | `fee8dfd`（2026-05-13） |
-| 运行环境 | **Linux + Docker**（Web UI 跨平台） |
-| 对外端口 | **1882** → 容器内 8000 |
+| 运行环境 | **Linux + Docker**（Web UI 跨平台；本地可用 Mock） |
+| 对外端口 | **1882** → 容器内 8000（本地开发：5173 / 8000） |
 
 业务细节、API、排障：[`docs/功能说明.md`](docs/功能说明.md)。变更摘要：[`docs/变更记录.md`](docs/变更记录.md)。说明：[`README.md`](README.md)。架构笔记：[`CLAUDE.md`](CLAUDE.md)。来源：[`docs/来源.md`](docs/来源.md)。
 
