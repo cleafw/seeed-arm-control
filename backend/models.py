@@ -81,6 +81,7 @@ class ArmStatus(BaseModel):
     label: str
     status: Literal[
         "ok",
+        "mock",
         "missing",
         "error",
         "reconnecting",

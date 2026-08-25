@@ -33,6 +33,7 @@ export interface MotorMapEntry {
 
 export type ArmLinkStatus =
   | "ok"
+  | "mock"
   | "missing"
   | "error"
   | "reconnecting"

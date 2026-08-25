@@ -128,8 +128,22 @@ export function StatusBanner({
   if (linkDown) {
     const m = snapshot.arms?.master;
     const s = snapshot.arms?.slave;
-    const mText = m ? `${m.label}·${m.status === "ok" ? "正常" : m.status === "reconnecting" ? "重连中" : m.status === "missing" ? "未接入" : "异常"}` : "主臂·?";
-    const sText = s ? `${s.label}·${s.status === "ok" ? "正常" : s.status === "reconnecting" ? "重连中" : s.status === "missing" ? "未接入" : "异常"}` : "从臂·?";
+    const armLinkText = (arm: typeof m, fallback: string) => {
+      if (!arm) return fallback;
+      const label =
+        arm.status === "ok"
+          ? "正常"
+          : arm.status === "mock"
+            ? "模拟"
+            : arm.status === "reconnecting"
+              ? "重连中"
+              : arm.status === "missing"
+                ? "未接入"
+                : "异常";
+      return `${arm.label}·${label}`;
+    };
+    const mText = armLinkText(m, "主臂·?");
+    const sText = armLinkText(s, "从臂·?");
     return (
       <div className="status-banner--idle status-banner--link-down">
         <span className="brand">rebot 录制管理</span>

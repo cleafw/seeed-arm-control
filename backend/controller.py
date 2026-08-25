@@ -482,13 +482,22 @@ _MOCK_JOINT_WAVES = {
 
 
 class MockMaster:
-    """Stand-in for PiPER_MateAgilex. Returns a deterministic, slowly-moving pose."""
+    """Stand-in for PiPER_MateAgilex.
 
-    def __init__(self, gripper_exist: bool = True):
+    Default: static zero pose (no fake motion when REBOT_MOCK=1).
+    Set REBOT_MOCK_WAVE=1 to restore slow sinusoids for UI demos.
+    """
+
+    def __init__(self, gripper_exist: bool = True, *, animate: bool = False):
         self.gripper_exist = gripper_exist
+        self._animate = animate
         self._t0 = time.monotonic()
 
     def get_fashionstar_joint_states(self) -> dict:
+        if not self._animate:
+            js = {k: 0.0 for k in _MOCK_JOINT_WAVES}
+            js["gripper"] = 0.0
+            return js
         t = time.monotonic() - self._t0
         js: dict = {}
         for k, (amp, period, phase) in _MOCK_JOINT_WAVES.items():
@@ -750,8 +759,9 @@ class Controller:
     # Hardware setup / teardown / reconnect
     # ------------------------------------------------------------------
     def arm_connected(self, which: str) -> bool:
+        """True when the arm link is usable for teleop (real ok or mock)."""
         st = self._arm_status.get(which) or {}
-        return st.get("status") == "ok"
+        return st.get("status") in ("ok", "mock")
 
     def arms_ready(self) -> bool:
         return self.arm_connected("master") and self.arm_connected("slave")
@@ -774,18 +784,30 @@ class Controller:
 
     def setup_hardware(self) -> None:
         if self.cfg.mock:
-            log.warning(
-                "REBOT_MOCK=1: synthesizing joint data, no serial I/O. "
-                "Use this for UI testing only."
+            animate = os.environ.get("REBOT_MOCK_WAVE", "0") not in (
+                "0",
+                "false",
+                "no",
+                "",
             )
-            self.master = MockMaster(gripper_exist=self.cfg.gripper_exist)
+            log.warning(
+                "REBOT_MOCK=1: no serial I/O (joints %s). UI testing only.",
+                "animated" if animate else "static zero",
+            )
+            self.master = MockMaster(
+                gripper_exist=self.cfg.gripper_exist, animate=animate
+            )
             mock_slave = MockSlave("mock_slave_1")
             mock_slave.setup()
             self.slaves = [mock_slave]
-            self._set_arm_status("master", "ok", detail="mock", port="<mock>")
-            self._set_arm_status("slave", "ok", detail="mock", port="<mock>")
+            self._set_arm_status(
+                "master", "mock", detail="未接真机（模拟）", port="<mock>"
+            )
+            self._set_arm_status(
+                "slave", "mock", detail="未接真机（模拟）", port="<mock>"
+            )
             self._arms_were_ready = True
-            self._arms_hint = None
+            self._arms_hint = "模拟模式：未接真机，关节为零位"
             return
 
         self._set_arm_status("master", "initializing", detail="正在连接…")
@@ -988,8 +1010,8 @@ class Controller:
             return
         self._last_reconnect_attempt = now
 
-        need_master = self.master is None or self._arm_status["master"]["status"] != "ok"
-        need_slave = (not self.slaves) or self._arm_status["slave"]["status"] != "ok"
+        need_master = self.master is None or not self.arm_connected("master")
+        need_slave = (not self.slaves) or not self.arm_connected("slave")
         if not need_master and not need_slave:
             return
 

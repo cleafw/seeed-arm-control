@@ -9,6 +9,7 @@ interface Props {
 
 const STATUS_LABEL: Record<ArmLinkStatus, string> = {
   ok: "正常",
+  mock: "模拟",
   missing: "未接入",
   error: "串口异常",
   reconnecting: "重连中",
@@ -17,7 +18,11 @@ const STATUS_LABEL: Record<ArmLinkStatus, string> = {
 
 function armDotClass(status: ArmLinkStatus | undefined): string {
   if (status === "ok") return "foot-bar__dot--ok";
-  if (status === "reconnecting" || status === "initializing") {
+  if (
+    status === "reconnecting" ||
+    status === "initializing" ||
+    status === "mock"
+  ) {
     return "foot-bar__dot--warn";
   }
   if (status === "error" || status === "missing") return "foot-bar__dot--err";
@@ -33,9 +38,13 @@ function ArmChip({ arm }: { arm: ArmStatus | undefined }) {
       </div>
     );
   }
-  const st = arm.status;
-  const detail =
-    st === "ok"
+  // Never treat mock / port "<mock>" as 正常 — even if an older backend
+  // still reports status "ok" with a mock port.
+  const isMock = arm.status === "mock" || arm.port === "<mock>";
+  const st: ArmLinkStatus = isMock ? "mock" : arm.status;
+  const detail = isMock
+    ? arm.detail || "未接真机（模拟）"
+    : st === "ok"
       ? arm.port || "已连接"
       : arm.detail || STATUS_LABEL[st] || st;
   return (
