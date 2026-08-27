@@ -582,10 +582,16 @@ class Controller:
     def __init__(self, cfg: Config, library: ActionLibrary):
         self.cfg = cfg
         self.library = library
-        if not cfg.master_port and not cfg.slave_port:
-            saved_ports = load_active_ports(cfg.recordings_dir)
-            if saved_ports:
-                cfg.master_port, cfg.slave_port = saved_ports
+        # Persisted UI port pairing wins over env (MASTER_PORT/SLAVE_PORT are
+        # first-boot defaults only when no active_ports.json exists yet).
+        saved_ports = load_active_ports(cfg.recordings_dir)
+        if saved_ports:
+            cfg.master_port, cfg.slave_port = saved_ports
+            log.info(
+                "Loaded persisted ports: leader=%s follower=%s",
+                saved_ports[0],
+                saved_ports[1],
+            )
 
         # ---- runtime state (all guarded by self.lock) ----
         self.lock = threading.RLock()
@@ -621,6 +627,7 @@ class Controller:
         self.last_joint_states: Optional[dict] = None        # last master read
         self.last_output_joint_states: Optional[dict] = None # last slave write (mapped)
         self.last_safety_joint_states: Optional[dict] = None  # last master-space safety baseline
+        self._safety_grace_until: float = 0.0
         self.last_measured_joint_states: Optional[dict] = None  # slave encoder
         self.frame_count: int = 0
         self.last_error: Optional[str] = None
@@ -707,20 +714,40 @@ class Controller:
 
         # Snapshot listeners (e.g., WS broadcaster)
         self._listeners: list = []
+        # Optional VoiceService.status_for_snapshot provider
+        self._voice_status_provider = None
+        # Optional VoiceService.on_master_js for follow_first preempt
+        self._voice_master_js_hook = None
+
+    def set_voice_status_provider(self, fn) -> None:
+        self._voice_status_provider = fn
+
+    def set_voice_master_js_hook(self, fn) -> None:
+        self._voice_master_js_hook = fn
+
+    def _notify_voice_master_js(self, js: dict | None) -> None:
+        if not js or self._voice_master_js_hook is None:
+            return
+        try:
+            self._voice_master_js_hook(js)
+        except Exception as e:  # noqa: BLE001
+            log.debug("voice master_js hook failed: %s", e)
 
     # ------------------------------------------------------------------
     # Arm profiles / pairing (phase 1.2 / 1.3)
     # ------------------------------------------------------------------
     def _boot_profile_ids(self, cfg: Config) -> tuple[str, str]:
         """Prefer saved active_profiles.json, then env, then legacy defaults."""
-        # A launcher-selected profile is intentional and must win over a
-        # stale persisted pairing (for example a previous B601 experiment).
-        if os.environ.get("LEADER_PROFILE") or os.environ.get("FOLLOWER_PROFILE"):
-            return self._resolve_profile_ids(cfg.leader_profile, cfg.follower_profile)
         saved = load_active_profiles(cfg.recordings_dir)
         if saved is not None:
             try:
-                return self._resolve_profile_ids(saved[0], saved[1])
+                resolved = self._resolve_profile_ids(saved[0], saved[1])
+                log.info(
+                    "Loaded persisted profiles: leader=%s follower=%s",
+                    resolved[0],
+                    resolved[1],
+                )
+                return resolved
             except Exception as e:  # noqa: BLE001
                 log.warning("Ignoring saved active_profiles.json: %s", e)
         return self._resolve_profile_ids(cfg.leader_profile, cfg.follower_profile)
@@ -1049,18 +1076,35 @@ class Controller:
         return self.snapshot()
 
     def set_so101_ports(self, leader_port: str, follower_port: str) -> dict:
-        """Persist an explicit leader/follower assignment for twin CH343 buses."""
+        """Persist an explicit leader/follower assignment for twin CH343 buses.
+
+        Allowed in idle / paused / follow / free_move (same gate as profile
+        select). Active teleop is paused first so the control loop does not
+        command the slave while serial ownership is swapped.
+        """
         leader_port, follower_port = leader_port.strip(), follower_port.strip()
         if not leader_port or not follower_port or leader_port == follower_port:
             raise ControllerError("主臂和从臂必须选择两个不同的串口")
         with self.lock:
-            if self.mode != "idle":
-                raise ControllerError("请在空闲状态下切换主从端口")
+            if self.mode in (
+                "calibrate",
+                "record",
+                "transition",
+                "playback",
+                "return_to_follow",
+            ):
+                raise ControllerError(
+                    f"当前模式 {self.mode} 下不能切换端口，请先停止录制/回放或结束校准"
+                )
             if (self.leader_profile_id, self.follower_profile_id) != (
                 "so101_leader",
                 "so101_follower",
             ):
                 raise ControllerError("端口配对仅适用于当前 SO-ARM101 主从组合")
+            # Stop commanding the follower while we drop/reopen serial ports.
+            if self.mode in ("follow", "free_move"):
+                self.mode = "paused"
+                self._arms_hint = "已切换主从端口，从臂已锁定；请点击「解除锁定」继续跟随"
             self.cfg.master_port = leader_port
             self.cfg.slave_port = follower_port
         try:
@@ -1692,6 +1736,10 @@ class Controller:
         self._reset_mapping_anchor(master_js)
         # last_output stays in slave/command space (mapped when calibration is on).
         self.last_output_joint_states = deepcopy(self._map_for_slave(master_js))
+        # After unlock / rebase, ignore spike auto-pause briefly (soft approach).
+        self._safety_grace_until = time.monotonic() + max(
+            2.5, float(self.cfg.return_time_s) + 0.5
+        )
 
     # ------------------------------------------------------------------
     # Public commands (called by REST handlers)
@@ -1777,6 +1825,35 @@ class Controller:
             if self.mode in ("playback", "transition", "return_to_follow"):
                 self._stop_active_locked()
                 self.mode = "follow"
+
+    def goto_joint_states(self, joint_states: dict) -> None:
+        """Blend from current slave output to a static pose (master-space joints).
+
+        On blend complete, returns to follow (transition_target_action is None).
+        """
+        if not joint_states:
+            raise ControllerError("goto_joint_states requires joint_states")
+        with self.lock:
+            if self.mode == "calibrate":
+                raise ControllerError("校准中请先完成或取消校准")
+            if self.mode == "record":
+                raise ControllerError("录制中不能跳转到命名姿态")
+            self._stop_active_locked()
+            from_js = self._current_output_js()
+            to_js = self._map_for_slave(deepcopy(joint_states))
+            if from_js is None:
+                # No reference — command pose immediately then follow.
+                self.last_output_joint_states = deepcopy(to_js)
+                self.mode = "follow"
+                log.info("goto_joint_states: no prior pose; applied immediately")
+                return
+            self.transition_start_time = time.monotonic()
+            self.transition_from_js = from_js
+            self.transition_to_js = to_js
+            self.transition_target_action = None
+            self.transition_target_mode = None
+            self.mode = "transition"
+            log.info("Transition → named pose (then follow)")
 
     def force_follow(self) -> None:
         with self.lock:
@@ -2528,7 +2605,7 @@ class Controller:
                 cmd_or_master = dict(self.last_output_joint_states)
             else:
                 cmd_or_master = master_js
-            return {
+            out = {
                 "ts": time.time(),
                 "mode": self.mode,
                 "safety_enabled": self.safety_enabled,
@@ -2571,6 +2648,12 @@ class Controller:
                 },
                 **self.profile_snapshot_fields(),
             }
+            if self._voice_status_provider is not None:
+                try:
+                    out["voice"] = self._voice_status_provider()
+                except Exception as e:  # noqa: BLE001
+                    log.debug("voice status provider failed: %s", e)
+            return out
 
     # ------------------------------------------------------------------
     # Main control loop (run in dedicated thread)
@@ -2634,6 +2717,7 @@ class Controller:
                             raise
                         if js:
                             self.last_joint_states = deepcopy(js)
+                            self._notify_voice_master_js(js)
                             # Block teleop until a valid calibration exists.
                             if not self._calibration_mapping_enabled():
                                 if self.mode == "follow":
@@ -2647,9 +2731,17 @@ class Controller:
                                     if self.safety_enabled else js
                                 )
                                 if send_js is None:
-                                    self.last_error = "safety: spike on master input"
-                                    self.pause()
-                                else:
+                                    if time.monotonic() < self._safety_grace_until:
+                                        log.warning(
+                                            "Safety spike ignored during post-unlock grace"
+                                        )
+                                        self._rebase_teleop_baseline(js)
+                                        send_js = js
+                                    else:
+                                        self.last_error = "safety: spike on master input"
+                                        self.pause()
+                                        send_js = None
+                                if send_js is not None:
                                     mapped = self._apply_mmap_blend(
                                         self._map_for_slave(send_js)
                                     )
@@ -2752,6 +2844,21 @@ class Controller:
                             self.last_measured_joint_states,
                         )
                     elif mode == "transition":
+                        # Sample master so follow_first can preempt voice.
+                        try:
+                            mjs = (
+                                self.master.get_fashionstar_joint_states()
+                                if self.master
+                                else None
+                            )
+                            if mjs:
+                                self.last_joint_states = deepcopy(mjs)
+                                self._notify_voice_master_js(mjs)
+                        except Exception as e:  # noqa: BLE001
+                            if self._is_link_error(e):
+                                self._enter_link_fault("master", e)
+                                continue
+                            log.debug("master sample in transition: %s", e)
                         # Blend endpoints are already in slave/hardware space
                         # (see start_playback). Do NOT run _map_for_slave again.
                         js = self._update_transition()
@@ -2760,6 +2867,20 @@ class Controller:
                             out_js = js
                             self.frame_count += 1
                     elif mode == "playback":
+                        try:
+                            mjs = (
+                                self.master.get_fashionstar_joint_states()
+                                if self.master
+                                else None
+                            )
+                            if mjs:
+                                self.last_joint_states = deepcopy(mjs)
+                                self._notify_voice_master_js(mjs)
+                        except Exception as e:  # noqa: BLE001
+                            if self._is_link_error(e):
+                                self._enter_link_fault("master", e)
+                                continue
+                            log.debug("master sample in playback: %s", e)
                         js = self._update_playback()
                         if js:
                             self._broadcast_to_slaves(self._map_for_slave(js))
@@ -2771,6 +2892,8 @@ class Controller:
                             self._broadcast_to_slaves(self._map_for_slave(js))
                             out_js = js
                             self.frame_count += 1
+                        if self.last_joint_states:
+                            self._notify_voice_master_js(self.last_joint_states)
                     elif mode == "paused":
                         # Safety lockout: do not write to slave. Slave's PID
                         # holds the last commanded pose. Master is intentionally

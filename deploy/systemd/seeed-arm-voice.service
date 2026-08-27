@@ -1,0 +1,26 @@
+[Unit]
+Description=seeed-arm-control Voice (ReSpeaker device listen)
+Documentation=file:///home/seeed/seeed/Project/seeed-arm-control/docs/语音部署说明.md
+After=network-online.target sound.target seeed-arm-control.service
+Wants=network-online.target
+Requires=seeed-arm-control.service
+
+[Service]
+Type=simple
+User=seeed
+Group=seeed
+SupplementaryGroups=audio dialout
+WorkingDirectory=/home/seeed/seeed/Project/seeed-arm-control
+EnvironmentFile=-/home/seeed/seeed/ENV/seeed-arm-control.env
+Environment=PYTHONUNBUFFERED=1
+Environment=REBOT_CORE_URL=http://127.0.0.1:1882
+Environment=VOICE_DEVICE_LISTEN=1
+Environment=VOICE_ALSA_DEVICE=plughw:CARD=ArrayUAC10,DEV=0
+ExecStartPre=/home/seeed/seeed/Project/seeed-arm-control/deploy/wait_core_health.sh
+ExecStart=/home/seeed/seeed/Project/seeed-arm-control/.venv/bin/uvicorn voice.app:app --host 0.0.0.0 --port 1883
+Restart=always
+RestartSec=5
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seeed.local/schemas/voice-intent.json",
+  "title": "VoiceIntent",
+  "description": "Voice module → Core intent. Voice never writes motors; Core validates whitelist then dispatches.",
+  "type": "object",
+  "required": ["intent"],
+  "additionalProperties": false,
+  "properties": {
+    "intent": {
+      "type": "string",
+      "enum": [
+        "estop",
+        "resume",
+        "stop_play",
+        "play_action",
+        "goto_pose",
+        "free_move",
+        "set_policy"
+      ]
+    },
+    "slots": {
+      "type": "object",
+      "description": "Intent-specific parameters",
+      "additionalProperties": true,
+      "properties": {
+        "action_id": { "type": "string" },
+        "action_name": { "type": "string" },
+        "pose_id": { "type": "string" },
+        "pose_name": { "type": "string" },
+        "mode": { "type": "string", "enum": ["loop", "once"] },
+        "policy": {
+          "type": "string",
+          "enum": ["follow_only", "voice_in_follow", "follow_first", "voice_first"]
+        }
+      }
+    },
+    "request_id": {
+      "type": "string",
+      "description": "Client correlation id (optional)"
+    },
+    "source": {
+      "type": "string",
+      "description": "Origin tag, e.g. mock|asr|ui|curl",
+      "default": "voice"
+    },
+    "utterance": {
+      "type": "string",
+      "description": "Optional original text for logging/TTS"
+    }
+  }
+}

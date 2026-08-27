@@ -60,6 +60,7 @@ export function StatusFoot({ connected, snapshot }: Props) {
   const arms = snapshot?.arms;
   const armsReady = arms?.ready ?? false;
   const hint = arms?.hint;
+  const voiceOn = Boolean(snapshot?.voice?.enabled);
 
   const toggleSafety = async () => {
     if (busy || !snapshot) return;
@@ -109,6 +110,13 @@ export function StatusFoot({ connected, snapshot }: Props) {
       {snapshot ? (
         <div className="foot-bar__item">{snapshot.frame_count.toLocaleString()} ticks</div>
       ) : null}
+      {voiceOn ? (
+        <div className="foot-bar__item" title="语音控制已在左侧面板启用">
+          <span className="foot-bar__dot foot-bar__dot--ok" />
+          <span>语音已开</span>
+        </div>
+      ) : null}
+
       <div className="foot-bar__spacer" />
       {snapshot?.last_error && !hint ? (
         <div className="foot-bar__item" style={{ color: safety ? "var(--accent-rec)" : "#fff" }}>

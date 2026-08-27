@@ -39,11 +39,17 @@ def save_active_ports(recordings_dir: Path, leader_port: str, follower_port: str
     recordings_dir.mkdir(parents=True, exist_ok=True)
     path = active_ports_path(recordings_dir)
     tmp = path.with_suffix(".json.tmp")
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "leader_port": leader_port,
+        "follower_port": follower_port,
+    }
     tmp.write_text(
-        json.dumps({"leader_port": leader_port, "follower_port": follower_port}, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     tmp.replace(path)
+    log.info("Saved active ports → %s (leader=%s follower=%s)", path, leader_port, follower_port)
     return path
 
 

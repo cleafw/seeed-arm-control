@@ -1,0 +1,22 @@
+[Unit]
+Description=seeed-arm-control Core (teleop / record / playback)
+Documentation=file:///home/seeed/seeed/Project/seeed-arm-control/docs/语音部署说明.md
+After=network-online.target sound.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=seeed
+Group=seeed
+SupplementaryGroups=dialout audio
+WorkingDirectory=/home/seeed/seeed/Project/seeed-arm-control
+EnvironmentFile=-/home/seeed/seeed/ENV/seeed-arm-control.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/seeed/seeed/Project/seeed-arm-control/.venv/bin/uvicorn backend.app:app --host 0.0.0.0 --port 1882
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

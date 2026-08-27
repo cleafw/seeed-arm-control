@@ -27,15 +27,25 @@ from .models import (
     ArmProfileInfo,
     HealthResponse,
     MotorMapRequest,
+    NamedPoseBody,
+    NamedPoseInfo,
     PlayRequest,
     ProfileSelectRequest,
     PortSelectRequest,
     RecordStartRequest,
     SafetyRequest,
     StateSnapshot,
+    VoiceCapability,
+    VoiceIntentRequest,
+    VoicePolicyRequest,
+    VoiceSettingsRequest,
+    VoiceStatus,
+    VoiceUtteranceRequest,
+    VoiceLiveCaptionRequest,
 )
 from .profiles import list_followers, list_leaders, list_profiles
 from .storage import ActionLibrary
+from .voice import NamedPoseStore, VoiceError, VoiceService
 
 log = logging.getLogger(__name__)
 
@@ -90,9 +100,22 @@ def build_app() -> FastAPI:
     cfg = Config.from_env()
     library = ActionLibrary(cfg.recordings_dir)
     library.migrate_legacy_slots()
+    poses = NamedPoseStore(cfg.recordings_dir)
     controller = Controller(cfg, library)
     hub = SnapshotHub()
     controller.add_listener(hub.push_from_thread)
+    voice = VoiceService(
+        enabled=cfg.voice_enabled,
+        health_url=cfg.voice_health_url,
+        policy=cfg.voice_policy,  # type: ignore[arg-type]
+        health_interval_s=cfg.voice_health_interval_s,
+        controller=controller,
+        library=library,
+        poses=poses,
+        settings_path=cfg.recordings_dir / "voice_settings.json",
+    )
+    controller.set_voice_status_provider(voice.status_for_snapshot)
+    controller.set_voice_master_js_hook(voice.on_master_js)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -115,9 +138,35 @@ def build_app() -> FastAPI:
         thread = threading.Thread(target=thread_target, daemon=True, name="controller")
         thread.start()
 
+        health_task: asyncio.Task | None = None
+
+        async def _voice_health_loop():
+            while True:
+                try:
+                    await run_in_threadpool(voice.ping_health)
+                except Exception:  # noqa: BLE001
+                    log.debug("voice health ping failed", exc_info=True)
+                await asyncio.sleep(cfg.voice_health_interval_s)
+
+        health_task = asyncio.create_task(_voice_health_loop(), name="voice-health")
+        await run_in_threadpool(voice.ping_health)
+
         try:
-            yield {"controller": controller, "library": library, "hub": hub, "cfg": cfg}
+            yield {
+                "controller": controller,
+                "library": library,
+                "hub": hub,
+                "cfg": cfg,
+                "voice": voice,
+                "poses": poses,
+            }
         finally:
+            if health_task is not None:
+                health_task.cancel()
+                try:
+                    await health_task
+                except asyncio.CancelledError:
+                    pass
             controller.request_shutdown()
             thread.join(timeout=5.0)
 
@@ -141,6 +190,7 @@ def build_app() -> FastAPI:
             mode=controller.mode,
             master_connected=controller.arm_connected("master"),
             slave_connected=controller.arm_connected("slave"),
+            voice=VoiceStatus(**voice.status_for_snapshot()),
             **controller.profile_snapshot_fields(),
         )
 
@@ -308,6 +358,133 @@ def build_app() -> FastAPI:
     async def set_motor_map(req: MotorMapRequest):
         controller.set_motor_map(req.map)
         return StateSnapshot(**controller.snapshot())
+
+    # ----------------------------------------------------------------------
+    # Voice (optional) + named poses
+    # ----------------------------------------------------------------------
+
+    @app.get("/api/voice/capability", response_model=VoiceCapability)
+    async def voice_capability():
+        return VoiceCapability(**voice.capability())
+
+    @app.post("/api/voice/policy", response_model=VoiceCapability)
+    async def voice_set_policy(req: VoicePolicyRequest):
+        try:
+            voice.set_policy(req.policy)
+        except VoiceError as e:
+            raise HTTPException(
+                status_code=e.http_status,
+                detail={"code": e.code, "message": e.detail},
+            ) from e
+        return VoiceCapability(**voice.capability())
+
+    @app.post("/api/voice/settings", response_model=VoiceCapability)
+    async def voice_settings(req: VoiceSettingsRequest):
+        """UI: enable checkbox + follow_first / voice_first priority."""
+        try:
+            voice.update_settings(enabled=req.enabled, policy=req.policy)
+        except VoiceError as e:
+            raise HTTPException(
+                status_code=e.http_status,
+                detail={"code": e.code, "message": e.detail},
+            ) from e
+        await run_in_threadpool(voice.ping_health)
+        return VoiceCapability(**voice.capability())
+
+    @app.post("/api/voice/intent")
+    async def voice_intent(req: VoiceIntentRequest):
+        try:
+            return await run_in_threadpool(
+                voice.handle_intent,
+                req.model_dump(),
+            )
+        except VoiceError as e:
+            raise HTTPException(
+                status_code=e.http_status,
+                detail={"code": e.code, "message": e.detail},
+            ) from e
+
+    @app.post("/api/voice/utterance")
+    async def voice_utterance(req: VoiceUtteranceRequest):
+        """Parse Chinese text with rule NLU and dispatch (no ASR required)."""
+        try:
+            return await run_in_threadpool(
+                voice.handle_utterance,
+                req.text,
+                source=req.source,
+            )
+        except VoiceError as e:
+            raise HTTPException(
+                status_code=e.http_status,
+                detail={"code": e.code, "message": e.detail},
+            ) from e
+
+    @app.post("/api/voice/live")
+    async def voice_live_caption(req: VoiceLiveCaptionRequest):
+        """Device ASR subtitle push for real-time UI captions."""
+        return await run_in_threadpool(
+            voice.set_live_caption,
+            req.text,
+            partial=req.partial,
+        )
+
+    @app.get("/api/named_poses", response_model=list[NamedPoseInfo])
+    async def list_named_poses():
+        return [NamedPoseInfo(**p) for p in poses.list()]
+
+    @app.put("/api/named_poses", response_model=NamedPoseInfo)
+    async def upsert_named_pose(body: NamedPoseBody):
+        try:
+            pose = await run_in_threadpool(
+                poses.upsert,
+                name=body.name,
+                joint_states=body.joint_states,
+                pose_id=body.id,
+                aliases=body.aliases,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return NamedPoseInfo(**pose)
+
+    @app.post("/api/named_poses/capture", response_model=NamedPoseInfo)
+    async def capture_named_pose(name: str, pose_id: str | None = None):
+        """Save current master (command-space) joints as a named pose."""
+        snap = controller.snapshot()
+        js = snap.get("master_joint_states") or snap.get("joint_states") or {}
+        if not js:
+            raise HTTPException(status_code=409, detail="当前无可用关节位姿")
+        try:
+            pose = await run_in_threadpool(
+                poses.upsert,
+                name=name,
+                joint_states={k: float(v) for k, v in js.items()},
+                pose_id=pose_id,
+                aliases=None,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return NamedPoseInfo(**pose)
+
+    @app.post("/api/named_poses/{pose_id}/goto", response_model=StateSnapshot)
+    async def goto_named_pose(pose_id: str):
+        pose = poses.get(pose_id)
+        if not pose:
+            raise HTTPException(status_code=404, detail="Named pose not found")
+        try:
+            await run_in_threadpool(
+                controller.goto_joint_states,
+                pose.get("joint_states") or {},
+            )
+        except ControllerError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        return StateSnapshot(**controller.snapshot())
+
+    @app.delete("/api/named_poses/{pose_id}")
+    async def delete_named_pose(pose_id: str):
+        ok = await run_in_threadpool(poses.delete, pose_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Named pose not found")
+        return {"ok": True}
 
     @app.get("/api/debug/slave")
     async def debug_slave():

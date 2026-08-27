@@ -8,6 +8,21 @@ from pydantic import BaseModel, Field
 
 
 PlayMode = Literal["loop", "once"]
+VoicePolicy = Literal[
+    "follow_only",
+    "voice_in_follow",
+    "follow_first",
+    "voice_first",
+]
+VoiceIntentId = Literal[
+    "estop",
+    "resume",
+    "stop_play",
+    "play_action",
+    "goto_pose",
+    "free_move",
+    "set_policy",
+]
 ControllerMode = Literal[
     "idle",
     "follow",
@@ -90,6 +105,78 @@ class ArmStatus(BaseModel):
     port: Optional[str] = None
 
 
+class VoiceStatus(BaseModel):
+    """Compact voice status embedded in health / WS snapshot."""
+    enabled: bool = False
+    reachable: bool = False
+    policy: VoicePolicy = "voice_in_follow"
+    last_intent: Optional[dict] = None
+    # Live subtitle from device ASR (partial or final).
+    live_text: Optional[str] = None
+    live_partial: bool = False
+    device_listening: bool = False
+
+
+class VoiceCapability(BaseModel):
+    enabled: bool
+    reachable: bool
+    policy: VoicePolicy
+    supported_intents: list[str] = Field(default_factory=list)
+    health_url: Optional[str] = None
+    last_health_check: Optional[float] = None
+    last_health_error: Optional[str] = None
+    last_intent: Optional[dict] = None
+    live_text: Optional[str] = None
+    live_partial: bool = False
+    device_listening: bool = False
+
+
+class VoiceIntentRequest(BaseModel):
+    intent: VoiceIntentId
+    slots: dict[str, Any] = Field(default_factory=dict)
+    request_id: Optional[str] = None
+    source: str = "voice"
+    utterance: Optional[str] = None
+
+
+class VoiceUtteranceRequest(BaseModel):
+    """Chinese text → rule NLU → intent (UI / Mock without ASR)."""
+    text: str
+    source: str = "ui"
+
+
+class VoiceLiveCaptionRequest(BaseModel):
+    """Device ASR subtitle push (partial while speaking / final)."""
+    text: str = ""
+    partial: bool = True
+
+
+class VoicePolicyRequest(BaseModel):
+    policy: VoicePolicy
+
+
+class VoiceSettingsRequest(BaseModel):
+    """Runtime voice enable + priority (UI checkbox / dropdown)."""
+    enabled: Optional[bool] = None
+    policy: Optional[VoicePolicy] = None
+
+
+class NamedPoseBody(BaseModel):
+    name: str
+    joint_states: dict[str, float]
+    id: Optional[str] = None
+    aliases: Optional[list[str]] = None
+
+
+class NamedPoseInfo(BaseModel):
+    id: str
+    name: str
+    aliases: list[str] = Field(default_factory=list)
+    joint_states: dict[str, float] = Field(default_factory=dict)
+    created_at: str
+    updated_at: str
+
+
 class HealthResponse(BaseModel):
     ok: bool
     mode: ControllerMode
@@ -98,6 +185,7 @@ class HealthResponse(BaseModel):
     leader_profile: Optional[str] = None
     follower_profile: Optional[str] = None
     pair_id: Optional[str] = None
+    voice: Optional[VoiceStatus] = None
 
 
 class ArmProfileInfo(BaseModel):
@@ -150,6 +238,8 @@ class StateSnapshot(BaseModel):
     pair_id: Optional[str] = None
     # Last USB profile auto-detect result
     profile_detect: Optional[dict] = None
+    # Optional voice module status (absent / disabled when VOICE_ENABLED=0)
+    voice: Optional[VoiceStatus] = None
 
 
 class MotorMapRequest(BaseModel):

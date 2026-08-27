@@ -98,6 +98,45 @@ export interface StateSnapshot {
   pair_id?: string | null;
   /** Last USB auto-detect result for leader/follower profiles. */
   profile_detect?: ProfileDetectInfo | null;
+  /** Optional voice module status when Core exposes it. */
+  voice?: VoiceStatus | null;
+}
+
+export type VoicePolicy =
+  | "follow_only"
+  | "voice_in_follow"
+  | "follow_first"
+  | "voice_first";
+
+export interface VoiceLastIntent {
+  ts?: number;
+  intent?: string | null;
+  ok?: boolean;
+  utterance?: string | null;
+  source?: string | null;
+  slots?: Record<string, unknown> | null;
+  result?: Record<string, unknown> | null;
+  error?: string | null;
+  message?: string | null;
+  request_id?: string | null;
+}
+
+export interface VoiceStatus {
+  enabled: boolean;
+  reachable: boolean;
+  policy: VoicePolicy;
+  last_intent?: VoiceLastIntent | null;
+  /** Real-time subtitle from Jetson ReSpeaker ASR. */
+  live_text?: string | null;
+  live_partial?: boolean;
+  device_listening?: boolean;
+}
+
+export interface VoiceCapability extends VoiceStatus {
+  supported_intents: string[];
+  health_url?: string | null;
+  last_health_check?: number | null;
+  last_health_error?: string | null;
 }
 
 export interface ProfileDetectInfo {

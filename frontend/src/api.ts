@@ -1,4 +1,13 @@
-import type { ActionMeta, ArmProfileInfo, ArmRole, MotorMapEntry, PlayMode, StateSnapshot } from "./types";
+import type {
+  ActionMeta,
+  ArmProfileInfo,
+  ArmRole,
+  MotorMapEntry,
+  PlayMode,
+  StateSnapshot,
+  VoiceCapability,
+  VoicePolicy,
+} from "./types";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -73,4 +82,31 @@ export const api = {
     }),
   remove: (id: string) =>
     req(`/api/actions/${id}`, { method: "DELETE" }),
+  voiceCapability: () => req<VoiceCapability>("/api/voice/capability"),
+  setVoicePolicy: (policy: VoicePolicy) =>
+    req<VoiceCapability>("/api/voice/policy", {
+      method: "POST",
+      body: JSON.stringify({ policy }),
+    }),
+  setVoiceSettings: (body: { enabled?: boolean; policy?: VoicePolicy }) =>
+    req<VoiceCapability>("/api/voice/settings", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  voiceIntent: (body: {
+    intent: string;
+    slots?: Record<string, unknown>;
+    request_id?: string;
+    source?: string;
+    utterance?: string;
+  }) =>
+    req<{ ok: boolean; intent: string; result: unknown }>("/api/voice/intent", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  voiceUtterance: (text: string, source = "ui") =>
+    req<{ ok: boolean; intent: string; result: unknown }>("/api/voice/utterance", {
+      method: "POST",
+      body: JSON.stringify({ text, source }),
+    }),
 };

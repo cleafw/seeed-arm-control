@@ -10,6 +10,7 @@ import { StatusFoot } from "./components/StatusFoot";
 import { CalibratePanel } from "./components/CalibratePanel";
 import { ArmSelectPanel } from "./components/ArmSelectPanel";
 import { ActionPicker } from "./components/ActionPicker";
+import { VoiceControlPanel } from "./components/VoiceControlPanel";
 
 export default function App() {
   return (
@@ -144,6 +145,10 @@ function AppInner() {
         )}
         <aside className="setup-panel">
           <ArmSelectPanel
+            snapshot={snapshot}
+            onToast={(kind, msg) => toast.push(kind, msg)}
+          />
+          <VoiceControlPanel
             snapshot={snapshot}
             onToast={(kind, msg) => toast.push(kind, msg)}
           />

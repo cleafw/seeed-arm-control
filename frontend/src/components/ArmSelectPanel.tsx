@@ -126,7 +126,7 @@ export function ArmSelectPanel({ snapshot, onToast }: Props) {
     setBusy(true);
     try {
       await api.selectProfiles(nextLeader, nextFollower);
-      onToast("ok", "已更新主臂 / 从臂选择");
+      onToast("ok", "已更新主臂 / 从臂选择（已永久保存）");
     } catch (e) {
       onToast("err", `切换臂型失败：${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -135,6 +135,10 @@ export function ArmSelectPanel({ snapshot, onToast }: Props) {
   };
 
   const onSelectPort = async (role: "leader" | "follower", port: string) => {
+    if (locked) {
+      onToast("warn", "录制/回放/校准时不能切换端口");
+      return;
+    }
     const other = portOptions.find((candidate) => candidate !== port);
     if (!other) {
       onToast("warn", "需要同时检测到两个不同端口后才能重新配对");
@@ -143,7 +147,7 @@ export function ArmSelectPanel({ snapshot, onToast }: Props) {
     setBusy(true);
     try {
       await api.selectPorts(role === "leader" ? port : other, role === "follower" ? port : other);
-      onToast("ok", "已按所选端口重新配对主臂和从臂");
+      onToast("ok", "已按所选端口重新配对主臂和从臂（已永久保存，下次开机仍有效）");
     } catch (e) {
       onToast("err", `端口配对失败：${e instanceof Error ? e.message : String(e)}`);
     } finally {

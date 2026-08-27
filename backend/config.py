@@ -26,6 +26,13 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "")
+
+
 @dataclass
 class Config:
     # --- hardware ---
@@ -63,12 +70,28 @@ class Config:
     # --- web ---
     ws_push_hz: int
 
+    # --- voice (optional; Voice module never writes motors) ---
+    voice_enabled: bool
+    voice_health_url: str | None
+    voice_policy: str
+    voice_health_interval_s: float
+
     @classmethod
     def from_env(cls) -> "Config":
         repo_root = Path(__file__).resolve().parent.parent
         recordings = Path(os.environ.get("REBOT_RECORDINGS_DIR", repo_root / "recordings"))
         leader_profile = os.environ.get("LEADER_PROFILE", "violin_102").strip() or "violin_102"
         follower_profile = os.environ.get("FOLLOWER_PROFILE", "b601_dm").strip() or "b601_dm"
+        policy = (
+            os.environ.get("VOICE_POLICY", "follow_first").strip() or "follow_first"
+        )
+        if policy not in (
+            "follow_only",
+            "voice_in_follow",
+            "follow_first",
+            "voice_first",
+        ):
+            policy = "follow_first"
         return cls(
             master_port=os.environ.get("MASTER_PORT") or None,
             slave_port=os.environ.get("SLAVE_PORT") or None,
@@ -92,4 +115,8 @@ class Config:
             spike_threshold_rad=_env_float("REBOT_SPIKE_THRESHOLD", 1.5),
             recover_blend_time_s=_env_float("REBOT_RECOVER_BLEND_TIME", 2.0),
             ws_push_hz=_env_int("REBOT_WS_PUSH_HZ", 10),
+            voice_enabled=_env_bool("VOICE_ENABLED", False),
+            voice_health_url=os.environ.get("VOICE_HEALTH_URL") or None,
+            voice_policy=policy,
+            voice_health_interval_s=_env_float("VOICE_HEALTH_INTERVAL", 5.0),
         )
