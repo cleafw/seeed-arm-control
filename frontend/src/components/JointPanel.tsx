@@ -1,4 +1,5 @@
 import { MODE_STYLE } from "../modeStyle";
+import { portColor } from "../portColor";
 import type { ControllerMode, MotorMapEntry } from "../types";
 import { MotorMapTable } from "./MotorMapTable";
 
@@ -33,12 +34,6 @@ function phaseDeg(v: number) {
   return ((((v % TAU) + TAU) % TAU) * 180) / Math.PI;
 }
 
-function portColor(port?: string | null) {
-  if (port === "COM11") return "#38bdf8";
-  if (port === "COM13") return "#a78bfa";
-  return "var(--text-dim)";
-}
-
 function fmt(v: number | undefined) {
   return typeof v === "number" && isFinite(v) ? v.toFixed(2) : "—";
 }
@@ -61,8 +56,12 @@ export function JointPanel({
   const cmd = joints ?? {};
   const slave = slaveJoints ?? {};
   const primaryLabel = masterLabel ? "主臂" : "命令";
-  const leaderColor = isSo101 ? portColor(leaderPort) : accent;
-  const followerColor = isSo101 ? portColor(followerPort) : "var(--text-dim)";
+  const leaderColor = isSo101
+    ? portColor(leaderPort, [leaderPort, followerPort])
+    : accent;
+  const followerColor = isSo101
+    ? portColor(followerPort, [leaderPort, followerPort])
+    : "var(--text-dim)";
 
   return (
     <aside className="joint-panel">

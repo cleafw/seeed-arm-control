@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { portColor } from "../portColor";
 import type { ArmProfileInfo, ProfileDetectInfo, StateSnapshot } from "../types";
 
 interface Props {
@@ -14,12 +15,6 @@ const BUSY_MODES = new Set([
   "playback",
   "return_to_follow",
 ]);
-
-function portColor(port: string) {
-  if (port === "COM11") return "#38bdf8";
-  if (port === "COM13") return "#a78bfa";
-  return "var(--text-dim)";
-}
 
 function detectHint(d: ProfileDetectInfo | null | undefined): string {
   if (!d) return "启动后将自动检测串口机型";
@@ -92,6 +87,9 @@ export function ArmSelectPanel({ snapshot, onToast }: Props) {
     new Set([leaderPort, followerPort].filter((port): port is string => Boolean(port))),
   );
   const isSo101Pair = leaderId === "so101_leader" && followerId === "so101_follower";
+  const portPeers = [leaderPort, followerPort];
+  const leaderPortColor = portColor(leaderPort, portPeers);
+  const followerPortColor = portColor(followerPort, portPeers);
 
   const onDetect = async () => {
     if (locked) {
@@ -180,9 +178,9 @@ export function ArmSelectPanel({ snapshot, onToast }: Props) {
       {isSo101Pair ? (
         <>
           <div className="arm-select-panel__field">
-            <span><i className="arm-select-panel__port-dot" style={{ background: portColor(leaderPort) }} />主臂端口</span>
-            <select style={{ color: portColor(leaderPort) }} value={leaderPort} disabled={busy || locked || portOptions.length < 2} onChange={(e) => onSelectPort("leader", e.target.value)} aria-label="主臂端口">
-              {portOptions.map((port) => <option key={port} value={port}>{port}</option>)}
+            <span><i className="arm-select-panel__port-dot" style={{ background: leaderPortColor }} />主臂端口</span>
+            <select style={{ color: leaderPortColor }} value={leaderPort} disabled={busy || locked || portOptions.length < 2} onChange={(e) => onSelectPort("leader", e.target.value)} aria-label="主臂端口">
+              {portOptions.map((port) => <option key={port} value={port} style={{ color: portColor(port, portOptions) }}>{port}</option>)}
             </select>
           </div>
         </>
@@ -204,9 +202,9 @@ export function ArmSelectPanel({ snapshot, onToast }: Props) {
       </div>
       {isSo101Pair ? (
         <div className="arm-select-panel__field">
-          <span><i className="arm-select-panel__port-dot" style={{ background: portColor(followerPort) }} />从臂端口</span>
-          <select style={{ color: portColor(followerPort) }} value={followerPort} disabled={busy || locked || portOptions.length < 2} onChange={(e) => onSelectPort("follower", e.target.value)} aria-label="从臂端口">
-            {portOptions.map((port) => <option key={port} value={port}>{port}</option>)}
+          <span><i className="arm-select-panel__port-dot" style={{ background: followerPortColor }} />从臂端口</span>
+          <select style={{ color: followerPortColor }} value={followerPort} disabled={busy || locked || portOptions.length < 2} onChange={(e) => onSelectPort("follower", e.target.value)} aria-label="从臂端口">
+            {portOptions.map((port) => <option key={port} value={port} style={{ color: portColor(port, portOptions) }}>{port}</option>)}
           </select>
         </div>
       ) : null}
