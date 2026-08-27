@@ -81,7 +81,6 @@ class ArmStatus(BaseModel):
     label: str
     status: Literal[
         "ok",
-        "mock",
         "missing",
         "error",
         "reconnecting",
@@ -116,9 +115,16 @@ class ArmProfileInfo(BaseModel):
 
 
 class ProfileSelectRequest(BaseModel):
-    """Manual leader/follower selection (phase 1.3)."""
+    """Legacy manual select (kept for API); UI uses auto-detect instead."""
     leader_profile: str
     follower_profile: str
+
+
+class PortSelectRequest(BaseModel):
+    """Explicit role-to-port binding for visually identical arm adapters."""
+
+    leader_port: str
+    follower_port: str
 
 
 class StateSnapshot(BaseModel):
@@ -142,6 +148,8 @@ class StateSnapshot(BaseModel):
     leader_profile: Optional[str] = None
     follower_profile: Optional[str] = None
     pair_id: Optional[str] = None
+    # Last USB profile auto-detect result
+    profile_detect: Optional[dict] = None
 
 
 class MotorMapRequest(BaseModel):

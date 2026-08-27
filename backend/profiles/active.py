@@ -9,11 +9,42 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 ACTIVE_FILENAME = "active_profiles.json"
+ACTIVE_PORTS_FILENAME = "active_ports.json"
 SCHEMA_VERSION = 1
 
 
 def active_profiles_path(recordings_dir: Path) -> Path:
     return recordings_dir / ACTIVE_FILENAME
+
+
+def active_ports_path(recordings_dir: Path) -> Path:
+    return recordings_dir / ACTIVE_PORTS_FILENAME
+
+
+def load_active_ports(recordings_dir: Path) -> Optional[tuple[str, str]]:
+    path = active_ports_path(recordings_dir)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        leader = str(data["leader_port"]).strip()
+        follower = str(data["follower_port"]).strip()
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        log.warning("Failed to read %s: %s", path, exc)
+        return None
+    return (leader, follower) if leader and follower and leader != follower else None
+
+
+def save_active_ports(recordings_dir: Path, leader_port: str, follower_port: str) -> Path:
+    recordings_dir.mkdir(parents=True, exist_ok=True)
+    path = active_ports_path(recordings_dir)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps({"leader_port": leader_port, "follower_port": follower_port}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+    return path
 
 
 def load_active_profiles(recordings_dir: Path) -> Optional[tuple[str, str]]:

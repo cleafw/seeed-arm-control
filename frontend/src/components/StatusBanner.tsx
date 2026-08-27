@@ -133,13 +133,11 @@ export function StatusBanner({
       const label =
         arm.status === "ok"
           ? "正常"
-          : arm.status === "mock"
-            ? "模拟"
-            : arm.status === "reconnecting"
-              ? "重连中"
-              : arm.status === "missing"
-                ? "未接入"
-                : "异常";
+          : arm.status === "reconnecting"
+            ? "重连中"
+            : arm.status === "missing"
+              ? "未接入"
+              : "异常";
       return `${arm.label}·${label}`;
     };
     const mText = armLinkText(m, "主臂·?");
@@ -199,6 +197,9 @@ export function StatusBanner({
   }
 
   if (snapshot.mode === "idle") {
+    const calibrationReady =
+      snapshot.calibration?.ready === true ||
+      snapshot.calibration?.mapping_enabled === true;
     return (
       <div className="status-banner--idle">
         <span className="brand">rebot 录制管理</span>
@@ -206,12 +207,21 @@ export function StatusBanner({
           {armsHint || "待校准 — 从臂未跟随"}
         </span>
         <span className="status-banner__action">
-          <RunToggleButton
-            freeMove={false}
-            onFreeMove={onFreeMove}
-            onResume={onResume}
-            disabled
-          />
+          {calibrationReady ? (
+            <EstopButton
+              paused
+              onPause={onPause}
+              onResume={onResume}
+              disabled={!armsReady}
+            />
+          ) : (
+            <RunToggleButton
+              freeMove={false}
+              onFreeMove={onFreeMove}
+              onResume={onResume}
+              disabled
+            />
+          )}
         </span>
       </div>
     );

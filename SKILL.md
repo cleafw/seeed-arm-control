@@ -13,7 +13,7 @@
 | 本仓库目录 | `seeed-arm-control` |
 | 上游 | https://github.com/Love4yzp/rebot-b601-102-record-demo |
 | 上游基准 commit | `fee8dfd`（2026-05-13） |
-| 运行环境 | **Linux + Docker**（Web UI 跨平台；本地可用 Mock） |
+| 运行环境 | **Linux + Docker**（Web UI 跨平台） |
 | 对外端口 | **1882** → 容器内 8000（本地开发：5173 / 8000） |
 
 业务细节、API、排障：[`docs/功能说明.md`](docs/功能说明.md)。变更摘要：[`docs/变更记录.md`](docs/变更记录.md)。说明：[`README.md`](README.md)。架构笔记：[`CLAUDE.md`](CLAUDE.md)。来源：[`docs/来源.md`](docs/来源.md)。
@@ -27,7 +27,6 @@
 - 主臂拖动、从臂跟随（含校准映射与电机重映射）
 - 录制 / 循环或单次回放动作库
 - 停止运行后手掰从臂，再恢复跟随
-- 无硬件时用 `REBOT_MOCK=1` 联调 UI
 
 **不适用**
 
@@ -73,18 +72,7 @@
 
 ## 快速上手
 
-### A. 无硬件联调 UI
-
-```bash
-# 仓库根目录
-export REBOT_MOCK=1   # Windows PowerShell: $env:REBOT_MOCK=1
-uv sync
-uv run uvicorn backend.app:app --reload --port 8000
-# 另开终端
-cd frontend && npm install && npm run dev
-```
-
-### B. Docker 部署
+### A. Docker 部署
 
 ```bash
 # 仓库根目录；按需准备 .env（MASTER_PORT/SLAVE_PORT 等）
@@ -94,7 +82,7 @@ docker compose -f deploy/docker-compose.seeed.yml up -d --build
 
 首次使用：中间栏「开始校准」扫满行程 → 完成 → 跟随。可选配置电机映射表。
 
-### C. 改代码后重建
+### B. 改代码后重建
 
 - 改 `backend/`：volume 挂载时 `docker compose ... up -d --force-recreate` 即可
 - 改 `frontend/`：需要 `--build`

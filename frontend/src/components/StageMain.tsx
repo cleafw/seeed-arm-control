@@ -31,6 +31,41 @@ export function StageMain({
   }
 
   if (snapshot.mode === "idle") {
+    const calibrationReady =
+      snapshot.calibration?.ready === true ||
+      snapshot.calibration?.mapping_enabled === true;
+    const armsReady = snapshot.arms?.ready !== false;
+
+    if (calibrationReady) {
+      return (
+        <div className="stage-panel stage-panel--center">
+          <div className="paused-stage">
+            <div className="paused-stage__title">从臂已锁定</div>
+            <div className="paused-stage__hint">
+              校准映射已加载。确认两臂周围没有障碍物后，点击下方按钮开始真实机械臂跟随。
+            </div>
+            <div className="paused-stage__actions">
+              <button
+                type="button"
+                className="paused-stage__resume"
+                disabled={!armsReady}
+                onClick={async () => {
+                  try {
+                    await api.resume();
+                    toast.push("ok", "正在使能从臂并开始跟随");
+                  } catch (e) {
+                    toast.push("err", `${e instanceof Error ? e.message : String(e)}`);
+                  }
+                }}
+              >
+                ▶ 解除锁定并开始跟随
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="stage-panel stage-panel--center">
         <div className="mode-indicator">

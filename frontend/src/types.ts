@@ -33,7 +33,6 @@ export interface MotorMapEntry {
 
 export type ArmLinkStatus =
   | "ok"
-  | "mock"
   | "missing"
   | "error"
   | "reconnecting"
@@ -97,6 +96,20 @@ export interface StateSnapshot {
   follower_profile?: string | null;
   /** `{leader}__{follower}` pairing key. */
   pair_id?: string | null;
+  /** Last USB auto-detect result for leader/follower profiles. */
+  profile_detect?: ProfileDetectInfo | null;
+}
+
+export interface ProfileDetectInfo {
+  status: "pending" | "ok" | "partial" | "none" | "ambiguous" | string;
+  message: string;
+  leader_id?: string | null;
+  follower_id?: string | null;
+  leader_port?: string | null;
+  follower_port?: string | null;
+  applied?: boolean;
+  leader_candidates?: Array<{ profile_id: string; port: string; label: string }>;
+  follower_candidates?: Array<{ profile_id: string; port: string; label: string }>;
 }
 
 export interface ActionMeta {

@@ -6,7 +6,6 @@ cd /d "%~dp0"
 title seeed-arm-control 启动
 echo ========================================
 echo   seeed-arm-control 本地验收启动
-echo   Mock 模式（无真机串口）
 echo   页面: http://localhost:5173
 echo ========================================
 echo.
@@ -48,11 +47,18 @@ if not exist "frontend\node_modules\" (
   echo [2/4] 前端依赖已存在，跳过 npm install
 )
 
-echo [3/4] 启动后端 http://127.0.0.1:8000 （新窗口）...
-start "seeed-arm-backend" cmd /k "cd /d "%~dp0" && set REBOT_MOCK=1 && uv run uvicorn backend.app:app --reload --host 127.0.0.1 --port 8000"
+rem 启动真机检测。后端会扫描已注册的机械臂类型并持续重试连接。
+set "REBOT_MODE_LABEL=真机自动检测（未检测到时会重试）"
+
+echo [3/4] 启动后端 http://127.0.0.1:8000 （%REBOT_MODE_LABEL%，新窗口）...
+rem /D supplies the working directory.  Keeping assignments inside the child
+rem command without nested quotes ensures they are not expanded to empty.
+rem Do not use uvicorn --reload here. Its watcher can outlive the launcher
+rem window on Windows and retain exclusive COM handles after a restart.
+start "seeed-arm-backend" /D "%~dp0" cmd /c "uv run uvicorn backend.app:app --host 127.0.0.1 --port 8000"
 
 echo [4/4] 启动前端 http://localhost:5173 （新窗口）...
-start "seeed-arm-frontend" cmd /k "cd /d "%~dp0frontend" && npm run dev -- --host 127.0.0.1 --port 5173"
+start "seeed-arm-frontend" /D "%~dp0frontend" cmd /c "npm run dev -- --host 127.0.0.1 --port 5173"
 
 echo.
 echo 等待服务就绪后打开浏览器...

@@ -33,12 +33,12 @@ class Config:
     slave_port: str | None
     baudrate: int               # slave DM_CAN baud
     master_baudrate: int        # leader Fashionstar UART (StarAi Violin = 1000000)
-    # Arm profile ids (backend.profiles); default = legacy Violin + B601 pair
+    # Arm profile ids (backend.profiles); used until auto-detection identifies
+    # a complete live pair.
     leader_profile: str
     follower_profile: str
     update_rate_hz: int
     gripper_exist: bool
-    mock: bool                  # synthesize joint data, no real serial I/O
 
     # --- recordings ---
     recordings_dir: Path
@@ -67,19 +67,18 @@ class Config:
     def from_env(cls) -> "Config":
         repo_root = Path(__file__).resolve().parent.parent
         recordings = Path(os.environ.get("REBOT_RECORDINGS_DIR", repo_root / "recordings"))
+        leader_profile = os.environ.get("LEADER_PROFILE", "violin_102").strip() or "violin_102"
+        follower_profile = os.environ.get("FOLLOWER_PROFILE", "b601_dm").strip() or "b601_dm"
         return cls(
             master_port=os.environ.get("MASTER_PORT") or None,
             slave_port=os.environ.get("SLAVE_PORT") or None,
             baudrate=_env_int("REBOT_BAUDRATE", 921600),
             # StarAi Violin / StarArm 102 official baud is 1000000 (not 115200).
             master_baudrate=_env_int("MASTER_BAUD", 1000000),
-            leader_profile=os.environ.get("LEADER_PROFILE", "violin_102").strip()
-            or "violin_102",
-            follower_profile=os.environ.get("FOLLOWER_PROFILE", "b601_dm").strip()
-            or "b601_dm",
+            leader_profile=leader_profile,
+            follower_profile=follower_profile,
             update_rate_hz=_env_int("REBOT_UPDATE_HZ", 30),
             gripper_exist=os.environ.get("REBOT_GRIPPER", "1") not in ("0", "false", "no"),
-            mock=os.environ.get("REBOT_MOCK", "0") not in ("0", "false", "no", ""),
             recordings_dir=recordings,
             return_time_s=_env_float("REBOT_RETURN_TIME", 2.0),
             transition_time_s=_env_float("REBOT_TRANSITION_TIME", 0.6),

@@ -9,10 +9,7 @@ Standalone teleop / record / playback service for **B601-DM master arm → SO102
 ## Dev commands
 
 ```bash
-# Backend dev (macOS / no hardware) — synthesizes joint data
-REBOT_MOCK=1 uv run uvicorn backend.app:app --reload --port 8000
-
-# Backend dev (Linux + real arms)
+# Backend dev (requires real arms)
 uv run uvicorn backend.app:app --reload --port 8000
 
 # Frontend dev (proxies /api + /ws to :8000)
@@ -53,12 +50,11 @@ The five `ControllerMode` values (`follow / record / transition / playback / ret
 
 `return_to_follow` re-reads the master each tick so the slave tracks toward the operator's *current* pose during the slow blend, not a stale snapshot.
 
-### Hardware abstraction & mock mode
+### Hardware abstraction
 
 - **Master**: `PiPER_MateAgilex` from `backend/pipermate.py` — CH340 / fashionstar UART; **read-only** (joint angles + gripper opening).
 - **Slave**: `SlaveArm` wrapping `MotorControl` from `backend/u2can/DM_CAN.py` — DM 4340/4310 motors; joints 1–6 use `POS_VEL`, joint 7 (gripper) uses `Torque_Pos` with force = 350 (3.5%).
 - **Port detection**: VID/PID match (master = `0x1a86:0x7523`, slave = manufacturer "HDSC" or product startswith "CDC"). Multiple candidates → first wins + warn. `MASTER_PORT`/`SLAVE_PORT` env override.
-- **Mock mode** (`REBOT_MOCK=1`): `MockMaster` returns slow per-joint sinusoids with different periods (so bars look organic, not synced); `MockSlave` is no-op. Branched in `Controller.setup_hardware()` *before* any serial probing — the only path that lets this run on macOS / without USB. Use this for any frontend work; the full state machine is exercised faithfully (transitions are real, durations are real, library writes are real).
 
 ### Storage
 
@@ -85,7 +81,6 @@ All optional. Full list in `backend/config.py`. Most-used:
 
 | Var | Default | Purpose |
 |---|---|---|
-| `REBOT_MOCK` | `0` | Synthesize joints, skip serial. **Required for macOS dev.** |
 | `MASTER_PORT` / `SLAVE_PORT` | auto-detect | Override VID/PID detection |
 | `REBOT_UPDATE_HZ` | `30` | Control-loop rate |
 | `REBOT_WS_PUSH_HZ` | `10` | WS broadcast rate (independent of control rate) |
@@ -99,4 +94,4 @@ All optional. Full list in `backend/config.py`. Most-used:
 - **Container char-major rules**: `deploy/docker-compose.yml` pins `device_cgroup_rules` to char major **188 (CH340)** and **166 (CDC ACM)**. If the host kernel uses different majors, `Permission denied: /dev/ttyXXX` even though the bind-mount is fine. Check with `ls -l /dev/ttyUSB0 /dev/ttyACM0` before deploying to a new box.
 - **`/dev` bind-mount**: docker-compose binds `/dev:/dev` so USB hot-replug is visible to the container without a restart. Don't replace this with named devices unless you also accept a container restart on every replug.
 - **Frontend dist served by FastAPI**: the static mount is added **last** in `build_app()` so `/api/*` and `/ws` win. Don't mount additional paths under `/`.
-- **Recording filter**: `_changed_enough` + `_filter` smooth & deduplicate frames. A motionless arm + small `min_joint_change_rad` produces a 2-frame action (the initial pose + end-hold pad) — not a bug, but watch for it when smoke-testing in mock mode (the synthetic sine is slow).
+- **Recording filter**: `_changed_enough` + `_filter` smooth & deduplicate frames. A motionless arm + small `min_joint_change_rad` produces a 2-frame action (the initial pose + end-hold pad) — not a bug.

@@ -98,6 +98,16 @@ export function CalibratePanel({ snapshot, onToast }: Props) {
   const slaveJs = snapshot?.slave_joint_states ?? {};
   const canStart = mode === "follow" || mode === "paused" || mode === "idle" || mode === "free_move";
   const canFinish = active;
+  // SO-ARM101 has five arm joints plus the gripper.  `joint6` remains in the
+  // generic legacy model for other arm profiles, but is not a physical motor
+  // on this profile and must not look like an incomplete calibration axis.
+  const isSo101 =
+    snapshot?.leader_profile === "so101_leader" &&
+    snapshot?.follower_profile === "so101_follower";
+  const displayedJoints = isSo101
+    ? JOINTS.filter((joint) => joint.key !== "joint6")
+    : JOINTS;
+  const startLabel = cal.saved_at ? "重新校准" : "开始校准";
 
   const start = useCallback(async () => {
     setBusy(true);
@@ -181,7 +191,7 @@ export function CalibratePanel({ snapshot, onToast }: Props) {
             disabled={busy || !canStart}
             onClick={start}
           >
-            {busy ? "…" : "开始校准"}
+            {busy ? "…" : startLabel}
           </button>
         )}
       </div>
@@ -205,7 +215,7 @@ export function CalibratePanel({ snapshot, onToast }: Props) {
       ) : null}
 
       <div className="cal-panel__joints">
-        {JOINTS.map((j) => {
+        {displayedJoints.map((j) => {
           const mr = cal.master?.[j.key] ?? { min: 0, max: 0 };
           const sr = cal.slave?.[j.key] ?? { min: 0, max: 0 };
           return (

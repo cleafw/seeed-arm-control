@@ -54,6 +54,13 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ leader_profile, follower_profile }),
     }),
+  detectProfiles: () =>
+    req<StateSnapshot>("/api/profiles/detect", { method: "POST" }),
+  selectPorts: (leader_port: string, follower_port: string) =>
+    req<StateSnapshot>("/api/ports/select", {
+      method: "POST",
+      body: JSON.stringify({ leader_port, follower_port }),
+    }),
   rename: (id: string, name: string) =>
     req<ActionMeta>(`/api/actions/${id}`, {
       method: "PATCH",

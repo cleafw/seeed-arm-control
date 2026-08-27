@@ -97,6 +97,16 @@ def _detect_id_map(bus: FashionStarServo) -> tuple[dict[str, int], list[str]]:
     return dict(_IDS_0_BASED), online_0
 
 
+def probe_fashionstar_positions(port: str, *, baudrate: int = 1_000_000) -> bool:
+    """Identify a Violin/Arm-102 from live angle monitors without writes."""
+    bus = FashionStarServo(port, baudrate=baudrate)
+    try:
+        monitors = bus.sync_monitor(list(range(7)))
+        return sum(1 for monitor in monitors.values() if monitor is not None) >= 5
+    finally:
+        bus.close()
+
+
 class PiPER_MateAgilex:
     """Violin / Arm-102 leader reader (name kept for controller compatibility)."""
 
@@ -318,7 +328,9 @@ class PiPER_MateAgilex:
         """Raise if USB node is gone or leader servos stop answering."""
         import os
 
-        if not self.port or not os.path.exists(self.port):
+        # Windows COM ports are not filesystem paths; the subsequent ping is
+        # the real liveness test. Linux/macOS still reject a vanished device.
+        if not self.port or (os.name != "nt" and not os.path.exists(self.port)):
             raise OSError(f"leader port missing: {self.port}")
         if self._bus is None:
             raise OSError("leader bus closed")

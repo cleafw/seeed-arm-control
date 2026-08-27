@@ -25,6 +25,27 @@ VIOLIN_102 = ArmProfile(
     driver_factory=None,  # phase 4 → wrap PiPER_MateAgilex
 )
 
+# Seeed SO-ARM101 kit = so101_leader + so101_follower (LeRobot teleop.type / robot.type).
+SO101_LEADER = ArmProfile(
+    id="so101_leader",
+    role="leader",
+    label="SO-ARM101 Leader",
+    label_zh="主臂 SO-ARM101",
+    description=(
+        "Seeed / TheRobotStudio SO-ARM101 leader (Feetech ST3215). "
+        "LeRobot teleop.type=so101_leader. Driver wired in phase 4."
+    ),
+    default_baudrate=1_000_000,
+    usb_hints=(
+        UsbMatchHint(
+            note="Bus Servo Driver Board USB-serial; confirm with lerobot-find-port",
+        ),
+    ),
+    capabilities=frozenset({"read_joints"}),
+    detector=None,
+    driver_factory=None,
+)
+
 # ---- followers ----
 
 B601_DM = ArmProfile(
@@ -58,12 +79,15 @@ SO101_FOLLOWER = ArmProfile(
     role="follower",
     label="SO-ARM101 Follower",
     label_zh="从臂 SO-ARM101",
-    description="LeRobot SO-ARM101 follower (ST3215). Driver wired in phase 4.",
+    description=(
+        "Seeed / TheRobotStudio SO-ARM101 follower (Feetech ST3215). "
+        "LeRobot robot.type=so101_follower. Driver wired in phase 4."
+    ),
     default_baudrate=1_000_000,
     usb_hints=(
         # Exact VID/PID varies by USB-serial adapter; refine in phase 2.
         UsbMatchHint(
-            note="Typically ACM/USB-serial; confirm with lerobot-find-port",
+            note="Bus Servo Driver Board USB-serial; confirm with lerobot-find-port",
         ),
     ),
     capabilities=frozenset({"write_joints", "named_poses", "free_move"}),
@@ -74,6 +98,7 @@ SO101_FOLLOWER = ArmProfile(
 
 def load_builtins() -> None:
     register(VIOLIN_102)
+    register(SO101_LEADER)
     register(B601_DM)
     register(SO101_FOLLOWER)
 

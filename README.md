@@ -121,7 +121,6 @@ http://<部署机IP>:1882
 | `REBOT_GRIPPER` | `1` | 是否带夹爪 |
 | `REBOT_RECORDINGS_DIR` | `recordings/` | 动作库根目录 |
 | `REBOT_WS_PUSH_HZ` | `10` | WebSocket 推送频率 |
-| `REBOT_MOCK` | `0` | `1` = 合成关节数据、跳过串口 I/O，仅用于 UI 联调 / macOS 本地开发 |
 
 ---
 
@@ -161,9 +160,6 @@ recordings/
 uv sync
 uv run uvicorn backend.app:app --reload --port 8000
 
-# 后端（无硬件 / macOS 联调 UI）
-REBOT_MOCK=1 uv run uvicorn backend.app:app --reload --port 8000
-
 # 前端（Vite dev，:5173 → 代理 /api 和 /ws 到 :8000）
 cd frontend
 npm install
@@ -171,10 +167,6 @@ npm run dev
 ```
 
 打开 `http://localhost:5173`。修改 `frontend/src/*.tsx` 热重载。
-
-**Mock 模式**：合成 7 路关节的慢正弦运动，slave 端 no-op。完整状态机（follow/record/transition/playback/return_to_follow）行为正常，时长/动作库 IO 都真跑，唯一区别是关节数据和电机控制都是假的。专门给 UI 联调用，**不要用于真机回归**。
-
----
 
 ## 故障排查
 

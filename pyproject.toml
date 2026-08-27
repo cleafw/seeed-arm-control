@@ -10,6 +10,7 @@ dependencies = [
     "pyserial>=3.5",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
+    "lerobot[feetech]>=0.4.4",
 ]
 
 [tool.uv]

@@ -29,6 +29,7 @@ from .models import (
     MotorMapRequest,
     PlayRequest,
     ProfileSelectRequest,
+    PortSelectRequest,
     RecordStartRequest,
     SafetyRequest,
     StateSnapshot,
@@ -165,7 +166,7 @@ def build_app() -> FastAPI:
 
     @app.post("/api/profiles/select", response_model=StateSnapshot)
     async def select_profiles(req: ProfileSelectRequest):
-        """Manually select leader/follower and persist to active_profiles.json."""
+        """Select leader/follower (legacy; prefer /api/profiles/detect)."""
         try:
             snap = await run_in_threadpool(
                 controller.set_profiles,
@@ -174,6 +175,30 @@ def build_app() -> FastAPI:
             )
         except ControllerError as e:
             raise HTTPException(status_code=409, detail=str(e))
+        return StateSnapshot(**snap)
+
+    @app.post("/api/profiles/detect", response_model=StateSnapshot)
+    async def detect_profiles():
+        """Auto-detect connected leader/follower from USB and select when unique."""
+        try:
+            snap = await run_in_threadpool(
+                controller.detect_and_apply_profiles,
+                "api",
+            )
+        except ControllerError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        return StateSnapshot(**snap)
+
+    @app.post("/api/ports/select", response_model=StateSnapshot)
+    async def select_ports(req: PortSelectRequest):
+        try:
+            snap = await run_in_threadpool(
+                controller.set_so101_ports,
+                req.leader_port,
+                req.follower_port,
+            )
+        except ControllerError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
         return StateSnapshot(**snap)
 
     @app.get("/api/actions", response_model=list[ActionMeta])
@@ -248,6 +273,12 @@ def build_app() -> FastAPI:
         # event loop so we don't stall WS pushes / other handlers.
         snap = await run_in_threadpool(controller.recover)
         return StateSnapshot(**snap)
+
+    @app.post("/api/shutdown", status_code=202)
+    async def shutdown_service():
+        """Stop the local controller loop so cleanup releases serial handles."""
+        controller.request_shutdown()
+        return {"status": "stopping"}
 
     @app.post("/api/calibrate/start", response_model=StateSnapshot)
     async def calibrate_start():

@@ -75,9 +75,10 @@ def calibration_ready(
     slave: dict[str, dict[str, float]],
     *,
     min_span: float = MIN_SPAN,
+    joint_keys: tuple[str, ...] = JOINT_KEYS,
 ) -> bool:
     """True if every arm joint (not gripper) has a usable span on both sides."""
-    for k in JOINT_KEYS:
+    for k in joint_keys:
         if k == "gripper":
             # Gripper optional: map only if both sides are valid; otherwise passthrough.
             continue
@@ -126,12 +127,13 @@ def ranges_payload(
     active: bool,
     saved_at: Optional[str],
     mapping_enabled: bool = False,
+    joint_keys: tuple[str, ...] = JOINT_KEYS,
 ) -> dict:
     return {
         "active": active,
         "saved_at": saved_at,
         "mapping_enabled": mapping_enabled,
-        "ready": calibration_ready(master, slave),
+        "ready": calibration_ready(master, slave, joint_keys=joint_keys),
         "master": deepcopy(master),
         "slave": deepcopy(slave),
     }

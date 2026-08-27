@@ -31,6 +31,7 @@ import serial.tools.list_ports
 from .calibration import (
     calibration_ready,
     expand_ranges,
+    is_range_valid,
     load_calibration,
     ranges_payload,
     save_calibration,
@@ -46,8 +47,17 @@ from .motor_map import (
     route_range_map,
     save_motor_map,
 )
-from .pipermate import PiPER_MateAgilex
-from .profiles import get_profile, load_active_profiles, pair_id as make_pair_id, save_active_profiles
+from .pipermate import PiPER_MateAgilex, probe_fashionstar_positions
+from .so101 import SO101Arm
+from .profiles import (
+    detect_arm_profiles,
+    get_profile,
+    load_active_profiles,
+    load_active_ports,
+    pair_id as make_pair_id,
+    save_active_profiles,
+    save_active_ports,
+)
 from .profiles.registry import ProfileError
 from .storage import ActionLibrary
 from .u2can.DM_CAN import (
@@ -71,7 +81,7 @@ def detect_ports(
     """Auto-detect master + slave serial ports.
 
     Master (Violin / Arm 102): CH340 FashionStar UART (VID=0x1a86, PID=0x7523).
-    Slave (B601-DM): HDSC CDC Damiao serial bridge.
+    Slave (B601-DM): HDSC CDC Damiao serial bridge, or CH343.
 
     Multiple candidates → log warning, pick first. None → return None.
     Caller passes env-var overrides as `preferred_master`/`preferred_slave`.
@@ -93,6 +103,7 @@ def detect_ports(
         p for p in ports
         if (p.manufacturer or "").upper() == "HDSC"
         or (p.product or "").upper().startswith("CDC")
+        or (p.vid == 0x1A86 and p.pid == 0x55D3)
     ]
 
     def pick(label: str, cands, preferred: Optional[str]) -> Optional[str]:
@@ -114,8 +125,64 @@ def detect_ports(
 
     return (
         pick("master (Violin / CH340)", master_candidates, preferred_master),
-        pick("slave (B601-DM / HDSC CDC)", slave_candidates, preferred_slave),
+        pick("slave (B601-DM / HDSC CDC / CH343)", slave_candidates, preferred_slave),
     )
+
+
+def detect_slave_port_candidates(preferred: Optional[str] = None) -> list[str]:
+    """Return every plausible B601 serial port, ordered for live probing.
+
+    USB adapters are often identical on both arms. Their VID/PID only gives us
+    candidates; the caller must read motor feedback to decide whether a port
+    is actually a reachable follower.
+    """
+    if preferred:
+        return [preferred]
+    ports = list(serial.tools.list_ports.comports())
+    candidates = [
+        p.device
+        for p in ports
+        if (p.manufacturer or "").upper() == "HDSC"
+        or (p.product or "").upper().startswith("CDC")
+        or (p.vid == 0x1A86 and p.pid == 0x55D3)
+    ]
+    return candidates
+
+
+def detect_so101_ports(
+    preferred_leader: Optional[str] = None,
+    preferred_follower: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return the two CH343 Feetech buses in a stable order.
+
+    Both Seeed controller boards have identical USB identities, so role cannot
+    be inferred from USB metadata.  Explicit ports win; otherwise natural COM
+    ordering provides a predictable default that users can override.
+    """
+    ports = sorted(
+        (
+            p.device
+            for p in serial.tools.list_ports.comports()
+            if p.vid == 0x1A86 and p.pid == 0x55D3
+        ),
+        key=lambda value: int("".join(ch for ch in value if ch.isdigit()) or 0),
+    )
+    # Preserve a saved assignment only while that COM port still exists.
+    # Windows may allocate a different COM number after a USB replug; in that
+    # case fall back to the currently enumerated buses instead of retrying a
+    # dead historical port forever.
+    leader = preferred_leader if preferred_leader in ports else None
+    follower = (
+        preferred_follower
+        if preferred_follower in ports and preferred_follower != leader
+        else None
+    )
+    remaining = [p for p in ports if p not in (leader, follower)]
+    if leader is None and remaining:
+        leader = remaining.pop(0)
+    if follower is None and remaining:
+        follower = remaining.pop(0)
+    return leader, follower
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +198,34 @@ class SlaveArm:
         self.serial_device: Optional[serial.Serial] = None
         self.motor_control: Optional[MotorControl] = None
         self.motors: list[Motor] = []
+
+    @staticmethod
+    def probe_positions(port: str, baudrate: int = 921600) -> bool:
+        """Read-only B601/DM-CAN identification from motor status feedback."""
+        device = serial.Serial(port, baudrate, timeout=0.15)
+        try:
+            control = MotorControl(device)
+            probes = (
+                Motor(DM_Motor_Type.DM4340, 0x01, 0x11),
+                Motor(DM_Motor_Type.DM4340, 0x02, 0x12),
+                Motor(DM_Motor_Type.DM4340, 0x03, 0x13),
+            )
+            for motor in probes:
+                control.addMotor(motor)
+            replies = 0
+            for motor in probes:
+                before = getattr(motor, "_rx_gen", 0)
+                control.refresh_motor_status(motor)
+                time.sleep(0.02)
+                try:
+                    control.recv()
+                except Exception:  # noqa: BLE001
+                    pass
+                if getattr(motor, "_rx_gen", 0) > before:
+                    replies += 1
+            return replies > 0
+        finally:
+            device.close()
 
     def setup(self) -> None:
         self.serial_device = serial.Serial(self.port, self.baudrate, timeout=0.5)
@@ -435,7 +530,10 @@ class SlaveArm:
 
     def check_link(self) -> None:
         """Raise if USB node is gone, serial closed, or motors stop answering."""
-        if not self.port or not os.path.exists(self.port):
+        # COM ports do not exist as regular paths on Windows. Opening the
+        # serial device and receiving CAN position feedback below is the
+        # authoritative liveness check there.
+        if not self.port or (os.name != "nt" and not os.path.exists(self.port)):
             raise OSError(f"[{self.name}] port missing: {self.port}")
         if self.serial_device is None or not self.serial_device.is_open:
             raise OSError(f"[{self.name}] serial closed")
@@ -465,92 +563,6 @@ class SlaveArm:
         )
 
 
-# ---------------------------------------------------------------------------
-# Mock master / slave — for laptop testing without hardware
-# ---------------------------------------------------------------------------
-
-# Per-joint sinusoid (amp_rad, period_s, phase_offset). Different periods so
-# the joint bars look organic, not synchronized.
-_MOCK_JOINT_WAVES = {
-    "joint1": (0.9, 8.0, 0.0),
-    "joint2": (0.6, 6.5, 1.0),
-    "joint3": (0.7, 5.5, 2.0),
-    "joint4": (0.8, 7.0, 0.5),
-    "joint5": (0.5, 4.5, 1.5),
-    "joint6": (0.6, 5.0, 2.5),
-}
-
-
-class MockMaster:
-    """Stand-in for PiPER_MateAgilex.
-
-    Default: static zero pose (no fake motion when REBOT_MOCK=1).
-    Set REBOT_MOCK_WAVE=1 to restore slow sinusoids for UI demos.
-    """
-
-    def __init__(self, gripper_exist: bool = True, *, animate: bool = False):
-        self.gripper_exist = gripper_exist
-        self._animate = animate
-        self._t0 = time.monotonic()
-
-    def get_fashionstar_joint_states(self) -> dict:
-        if not self._animate:
-            js = {k: 0.0 for k in _MOCK_JOINT_WAVES}
-            js["gripper"] = 0.0
-            return js
-        t = time.monotonic() - self._t0
-        js: dict = {}
-        for k, (amp, period, phase) in _MOCK_JOINT_WAVES.items():
-            js[k] = amp * math.sin(2 * math.pi * t / period + phase)
-        # Gripper: smooth 0..1 wave so the bar visibly moves.
-        js["gripper"] = 0.5 + 0.5 * math.sin(2 * math.pi * t / 9.0)
-        return js
-
-    def close(self) -> None:
-        pass
-
-    def check_link(self) -> None:
-        return
-
-
-class MockSlave:
-    """Stand-in for SlaveArm. Accepts joint targets but does nothing."""
-
-    def __init__(self, name: str = "mock_slave"):
-        self.name = name
-        self.port = "<mock>"
-
-    def setup(self) -> None:
-        log.info("[%s] mock slave initialized (no serial I/O)", self.name)
-
-    def send_joint_states(self, js: dict) -> None:
-        # Echo commanded pose as "measured" so the UI dual bars work in mock.
-        self._measured = dict(js)
-
-    def recover(self) -> None:
-        return
-
-    def get_measured_joint_states(self) -> dict:
-        return dict(getattr(self, "_measured", {}) or {})
-
-    def poll_measured_joint_states(self) -> dict:
-        return self.get_measured_joint_states()
-
-    def disable_all(self) -> None:
-        return
-
-    def enter_free_move(self) -> None:
-        return
-
-    def hold_free_move(self) -> dict:
-        return self.get_measured_joint_states()
-
-    def enable_all(self) -> None:
-        return
-
-    def safe_shutdown(self, duration: float = 2.0, steps: int = 20) -> None:
-        return
-
     def close(self) -> None:
         return
 
@@ -570,6 +582,10 @@ class Controller:
     def __init__(self, cfg: Config, library: ActionLibrary):
         self.cfg = cfg
         self.library = library
+        if not cfg.master_port and not cfg.slave_port:
+            saved_ports = load_active_ports(cfg.recordings_dir)
+            if saved_ports:
+                cfg.master_port, cfg.slave_port = saved_ports
 
         # ---- runtime state (all guarded by self.lock) ----
         self.lock = threading.RLock()
@@ -629,6 +645,11 @@ class Controller:
         self._arms_hint: Optional[str] = None
         self._last_reconnect_attempt: float = 0.0
         self._reconnect_interval_s: float = 2.0
+        # The control thread and the HTTP "自动检测" action can both ask for a
+        # reconnect.  A CH343 handle must never be closed/opened by two
+        # threads at once; Windows will otherwise intermittently reject the
+        # second open even though the COM port is present.
+        self._hardware_reconnect_lock = threading.RLock()
         self._arms_were_ready: bool = False
         self._ever_had_link_fault: bool = False
         self._probe_fail_counts: dict[str, int] = {"master": 0, "slave": 0}
@@ -637,6 +658,17 @@ class Controller:
         # Active arm profiles (phase 1.2/1.3; UI select + persist)
         self.leader_profile_id, self.follower_profile_id = self._boot_profile_ids(cfg)
         self.pair_id = make_pair_id(self.leader_profile_id, self.follower_profile_id)
+        self._profile_detect: dict = {
+            "status": "pending",
+            "message": "尚未检测",
+            "leader_id": None,
+            "follower_id": None,
+            "leader_port": None,
+            "follower_port": None,
+            "leader_candidates": [],
+            "follower_candidates": [],
+            "applied": False,
+        }
         log.info(
             "Active pairing: leader=%s follower=%s pair_id=%s",
             self.leader_profile_id,
@@ -661,14 +693,17 @@ class Controller:
         # Soft blend after motor_map change (slave-space from → live mapped target)
         self._mmap_blend_start: Optional[float] = None
         self._mmap_blend_from: Optional[dict] = None
-        # Teleop only after a valid calibration is saved.
-        self.mode: ControllerMode = (
-            "follow" if calibration_ready(m_r, s_r) else "idle"
-        )
+        # Keep stable wrap-branch anchors for mapping (prevents 0/2π jumps).
+        self._mapping_anchor: dict[str, float] = {}
+        # A saved calibration defines the mapping, but it is never consent to
+        # move a real arm at application startup.  Opening a service while the
+        # two arms are in different poses must leave the follower torque off
+        # until the operator explicitly presses "解除锁定" / "开始跟随".
+        self.mode: ControllerMode = "idle"
 
         # Hardware (set in setup_hardware)
-        self.master: Optional[PiPER_MateAgilex] = None
-        self.slaves: list[SlaveArm] = []
+        self.master: Optional[PiPER_MateAgilex | SO101Arm] = None
+        self.slaves: list[SlaveArm | SO101Arm] = []
 
         # Snapshot listeners (e.g., WS broadcaster)
         self._listeners: list = []
@@ -678,6 +713,10 @@ class Controller:
     # ------------------------------------------------------------------
     def _boot_profile_ids(self, cfg: Config) -> tuple[str, str]:
         """Prefer saved active_profiles.json, then env, then legacy defaults."""
+        # A launcher-selected profile is intentional and must win over a
+        # stale persisted pairing (for example a previous B601 experiment).
+        if os.environ.get("LEADER_PROFILE") or os.environ.get("FOLLOWER_PROFILE"):
+            return self._resolve_profile_ids(cfg.leader_profile, cfg.follower_profile)
         saved = load_active_profiles(cfg.recordings_dir)
         if saved is not None:
             try:
@@ -688,7 +727,7 @@ class Controller:
 
     @staticmethod
     def _resolve_profile_ids(leader_id: str, follower_id: str) -> tuple[str, str]:
-        """Validate profile ids; fall back to legacy Violin + B601."""
+        """Validate profile ids; fall back to the original generic pair."""
         default_leader, default_follower = "violin_102", "b601_dm"
         try:
             leader = get_profile(leader_id)
@@ -718,10 +757,264 @@ class Controller:
             "leader_profile": self.leader_profile_id,
             "follower_profile": self.follower_profile_id,
             "pair_id": self.pair_id,
+            "profile_detect": dict(self._profile_detect),
         }
 
+    def _active_joint_keys(self) -> tuple[str, ...]:
+        if (self.leader_profile_id, self.follower_profile_id) == ("so101_leader", "so101_follower"):
+            return ("joint1", "joint2", "joint3", "joint4", "joint5", "gripper")
+        return MOTOR_MAP_KEYS
+
+    def _calibration_ready(self) -> bool:
+        return calibration_ready(
+            self.cal_master_ranges,
+            self.cal_slave_ranges,
+            joint_keys=self._active_joint_keys(),
+        )
+
+    @staticmethod
+    def _unwrap_to_reference(value: float, reference: float) -> float:
+        """Return `value` shifted by k×2π to be closest to reference."""
+        return value + math.tau * round((reference - value) / math.tau)
+
+    @staticmethod
+    def _angular_delta(a: float, b: float) -> float:
+        """Signed shortest delta on a circle (radians)."""
+        return (b - a + math.pi) % math.tau - math.pi
+
+    @staticmethod
+    def _is_circular_joint(joint: str) -> bool:
+        """Gripper is treated as linear; all other joints use circular shortest-path math."""
+        return joint != "gripper"
+
+    @staticmethod
+    def _circular_lerp(a: float, b: float, alpha: float) -> float:
+        return a + alpha * Controller._angular_delta(a, b)
+
+    def _alignment_reference_for_joint(self, joint: str) -> Optional[float]:
+        prev = self._mapping_anchor.get(joint)
+        if prev is not None:
+            return prev
+        if not self._calibration_ready():
+            return None
+        slot = self.cal_master_ranges.get(joint)
+        if not is_range_valid(slot):
+            return None
+        return (float(slot["min"]) + float(slot["max"])) / 2.0
+
+    def _align_master_for_mapping(self, master_js: dict) -> dict:
+        aligned = dict(master_js)
+        if not self._calibration_ready():
+            return aligned
+        for key in self._active_joint_keys():
+            slot = self.cal_master_ranges.get(key)
+            if not is_range_valid(slot):
+                self._mapping_anchor.pop(key, None)
+                continue
+            value = master_js.get(key)
+            if not isinstance(value, (int, float)):
+                self._mapping_anchor.pop(key, None)
+                continue
+            reference = self._alignment_reference_for_joint(key)
+            if reference is None:
+                continue
+            unwrapped = self._unwrap_to_reference(float(value), float(reference))
+            aligned[key] = unwrapped
+            self._mapping_anchor[key] = unwrapped
+        return aligned
+
+    def _reset_mapping_anchor(self, master_js: Optional[dict] = None) -> None:
+        self._mapping_anchor = {}
+        if not self._calibration_ready():
+            return
+        if not isinstance(master_js, dict):
+            return
+        for key in self._active_joint_keys():
+            slot = self.cal_master_ranges.get(key)
+            if not is_range_valid(slot):
+                continue
+            value = master_js.get(key)
+            if not isinstance(value, (int, float)):
+                continue
+            mid = (float(slot["min"]) + float(slot["max"])) / 2.0
+            self._mapping_anchor[key] = self._unwrap_to_reference(float(value), mid)
+
+    def _discover_live_so101_ports(self) -> list[str]:
+        """Read-probe every USB serial arm candidate for a complete SO-ARM101.
+
+        This discovery is deliberately independent from the selected profiles.
+        It never enables torque or sends a position command: a candidate is
+        reported only after all six Feetech Present_Position registers reply.
+        Existing live SO-ARM101 instances are reused so their COM handles are
+        not opened twice.
+        """
+        live: list[str] = []
+        active: dict[str, SO101Arm] = {}
+        if isinstance(self.master, SO101Arm):
+            active[self.master.port] = self.master
+        for slave in self.slaves:
+            if isinstance(slave, SO101Arm):
+                active[slave.port] = slave
+
+        for port_info in serial.tools.list_ports.comports():
+            # Only USB serial devices are arm candidates.  This avoids opening
+            # unrelated built-in / Bluetooth COM ports during discovery.
+            if port_info.vid is None and port_info.pid is None:
+                continue
+            port = port_info.device
+            arm = active.get(port)
+            temporary = arm is None
+            if temporary:
+                arm = SO101Arm(port, name="so101_discovery")
+            try:
+                if temporary:
+                    arm.setup()
+                if arm.get_fashionstar_joint_states():
+                    live.append(port)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("SO-ARM101 probe skipped %s: %s", port, exc)
+            finally:
+                if temporary:
+                    try:
+                        arm.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+        return live
+
+    def _discover_live_profiles(self) -> dict[str, list[str]]:
+        """Scan every supported USB arm family using feedback-only probes."""
+        found: dict[str, list[str]] = {
+            "so101_leader": self._discover_live_so101_ports(),
+            "so101_follower": [],
+            "violin_102": [],
+            "b601_dm": [],
+        }
+        found["so101_follower"] = list(found["so101_leader"])
+        so101_ports = set(found["so101_leader"])
+
+        for info in serial.tools.list_ports.comports():
+            port = info.device
+            if not port or port in so101_ports:
+                continue
+            try:
+                if info.vid == 0x1A86 and info.pid == 0x7523:
+                    if probe_fashionstar_positions(port):
+                        found["violin_102"].append(port)
+                elif (
+                    (info.manufacturer or "").upper() == "HDSC"
+                    or (info.product or "").upper().startswith("CDC")
+                    or (info.vid == 0x1A86 and info.pid == 0x55D3)
+                ):
+                    if SlaveArm.probe_positions(port):
+                        found["b601_dm"].append(port)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Profile feedback probe skipped %s: %s", port, exc)
+        return {profile: ports for profile, ports in found.items() if ports}
+
+    def detect_and_apply_profiles(self, source: str = "manual") -> dict:
+        """Auto-select only arms that can return live joint-position data.
+
+        USB VID/PID is used only to find a serial candidate. A profile is
+        considered detected after its driver has read live position feedback;
+        users can always override the selected profiles from the UI.
+        """
+        self._try_reconnect(force=True)
+        live_profiles = self._discover_live_profiles()
+        result = detect_arm_profiles(live_profiles=live_profiles)
+        info = result.to_dict()
+        scan_message = result.message
+
+        # A USB adapter alone is not proof that an arm is connected. Confirm
+        # the candidate with actual joint-position reads from its driver.
+        leader_live = False
+        follower_live = False
+        leader_port: Optional[str] = None
+        follower_port: Optional[str] = None
+        try:
+            if self.master is not None and self.arm_connected("master"):
+                leader_live = bool(self.master.get_fashionstar_joint_states())
+                leader_port = self._arm_status["master"].get("port")
+        except Exception as e:  # noqa: BLE001
+            log.warning("Leader position probe failed: %s", e)
+        try:
+            if self.slaves and self.arm_connected("slave"):
+                measured = self.slaves[0].poll_measured_joint_states()
+                follower_live = bool(measured)
+                follower_port = self._arm_status["slave"].get("port")
+        except Exception as e:  # noqa: BLE001
+            log.warning("Follower position probe failed: %s", e)
+
+        # Report the physical scan results.  Do not overwrite them with the
+        # pair that happened to be selected before the scan began.
+        if not info.get("leader_id"):
+            info["leader_id"] = self.leader_profile_id if leader_live else None
+        if not info.get("follower_id"):
+            info["follower_id"] = self.follower_profile_id if follower_live else None
+        if not info.get("leader_port"):
+            info["leader_port"] = leader_port
+        if not info.get("follower_port"):
+            info["follower_port"] = follower_port
+
+        if leader_live and follower_live:
+            info["status"] = "ok"
+            info["message"] = (
+                f"{scan_message} 已确认当前主臂和从臂均能读取关节位置。"
+            )
+        elif leader_live or follower_live:
+            which = "主臂" if leader_live else "从臂"
+            missing = "从臂" if leader_live else "主臂"
+            info["status"] = "partial"
+            info["message"] = (
+                f"{scan_message} 已读取{which}关节位置数据，未读取到{missing}位置数据"
+            )
+        else:
+            info["status"] = "none"
+            info["message"] = (
+                f"{scan_message} 未读取到当前主从配置的机械臂关节位置数据"
+                "（请检查供电、USB 和通讯线）"
+            )
+
+        if result.status == "ok" and result.leader_id and result.follower_id:
+            try:
+                # Live feedback is the authoritative confirmation.  With two
+                # identical CH343 adapters USB hints cannot determine which
+                # arm is which, so do not replace an explicit SO-ARM101 pair
+                # with the legacy B601 profile merely because it shares VID/PID.
+                detected_leader = result.leader_id or self.leader_profile_id
+                detected_follower = result.follower_id or self.follower_profile_id
+                changed = (detected_leader, detected_follower) != (
+                    self.leader_profile_id,
+                    self.follower_profile_id,
+                )
+                self.set_profiles(detected_leader, detected_follower)
+                if changed:
+                    # A scan is permitted to select a different physical arm
+                    # type.  Reopen under its driver before declaring it live.
+                    self._drop_master(quiet=True)
+                    self._drop_slave(quiet=True, safe=False)
+                    self._try_reconnect(force=True)
+                info["applied"] = True
+            except ControllerError as e:
+                info["applied"] = False
+                info["message"] = f"{info['message']}；未能应用：{e}"
+            self._profile_detect = info
+            log.info(
+                "Profile detect (%s): %s applied=%s",
+                source,
+                info["status"],
+                info["applied"],
+            )
+            return self.snapshot()
+
+        # A partial scan must not persist a mixed leader/follower pair. Keep
+        # the current manual choices until a complete pair is identified.
+        info["applied"] = False
+        self._profile_detect = info
+        log.info("Profile detect (%s): %s — %s", source, info["status"], info["message"])
+        return self.snapshot()
+
     def set_profiles(self, leader_id: str, follower_id: str) -> dict:
-        """Manually select leader/follower profiles and persist (phase 1.3).
+        """Select leader/follower profiles and persist (used by auto-detect).
 
         Does not hot-swap drivers yet (phase 4). Switching while calibrating /
         recording / playing is rejected.
@@ -755,13 +1048,44 @@ class Controller:
             log.info("Profiles updated → %s (persist ok)", new_pair)
         return self.snapshot()
 
+    def set_so101_ports(self, leader_port: str, follower_port: str) -> dict:
+        """Persist an explicit leader/follower assignment for twin CH343 buses."""
+        leader_port, follower_port = leader_port.strip(), follower_port.strip()
+        if not leader_port or not follower_port or leader_port == follower_port:
+            raise ControllerError("主臂和从臂必须选择两个不同的串口")
+        with self.lock:
+            if self.mode != "idle":
+                raise ControllerError("请在空闲状态下切换主从端口")
+            if (self.leader_profile_id, self.follower_profile_id) != (
+                "so101_leader",
+                "so101_follower",
+            ):
+                raise ControllerError("端口配对仅适用于当前 SO-ARM101 主从组合")
+            self.cfg.master_port = leader_port
+            self.cfg.slave_port = follower_port
+        try:
+            save_active_ports(self.cfg.recordings_dir, leader_port, follower_port)
+        except OSError as exc:
+            raise ControllerError(f"保存端口配对失败: {exc}") from exc
+
+        # Both adapters are read-only at this stage.  Reopen them under the
+        # new ownership so the next feedback read proves the selected pairing.
+        self._drop_master(quiet=True)
+        self._drop_slave(quiet=True, safe=False)
+        self._set_arm_status("master", "reconnecting", detail="正在应用主臂端口", port=leader_port)
+        self._set_arm_status("slave", "reconnecting", detail="正在应用从臂端口", port=follower_port)
+        self._try_reconnect(force=True)
+        if not self.arms_ready():
+            raise ControllerError("端口已保存，但未能读取所选机械臂的位置数据")
+        return self.snapshot()
+
     # ------------------------------------------------------------------
     # Hardware setup / teardown / reconnect
     # ------------------------------------------------------------------
     def arm_connected(self, which: str) -> bool:
-        """True when the arm link is usable for teleop (real ok or mock)."""
+        """True when the physical arm link is usable for teleoperation."""
         st = self._arm_status.get(which) or {}
-        return st.get("status") in ("ok", "mock")
+        return st.get("status") == "ok"
 
     def arms_ready(self) -> bool:
         return self.arm_connected("master") and self.arm_connected("slave")
@@ -783,38 +1107,16 @@ class Controller:
             cur["port"] = port
 
     def setup_hardware(self) -> None:
-        if self.cfg.mock:
-            animate = os.environ.get("REBOT_MOCK_WAVE", "0") not in (
-                "0",
-                "false",
-                "no",
-                "",
-            )
-            log.warning(
-                "REBOT_MOCK=1: no serial I/O (joints %s). UI testing only.",
-                "animated" if animate else "static zero",
-            )
-            self.master = MockMaster(
-                gripper_exist=self.cfg.gripper_exist, animate=animate
-            )
-            mock_slave = MockSlave("mock_slave_1")
-            mock_slave.setup()
-            self.slaves = [mock_slave]
-            self._set_arm_status(
-                "master", "mock", detail="未接真机（模拟）", port="<mock>"
-            )
-            self._set_arm_status(
-                "slave", "mock", detail="未接真机（模拟）", port="<mock>"
-            )
-            self._arms_were_ready = True
-            self._arms_hint = "模拟模式：未接真机，关节为零位"
-            return
-
         self._set_arm_status("master", "initializing", detail="正在连接…")
         self._set_arm_status("slave", "initializing", detail="正在连接…")
         # Soft connect: missing/failed ports leave the HTTP server up and
         # the control loop will keep retrying until both arms are back.
         self._try_reconnect(force=True)
+        self.detect_and_apply_profiles("boot")
+        if self._calibration_ready() and self.arms_ready():
+            with self.lock:
+                self._arms_hint = "已加载校准映射；从臂保持锁定，请点击「解除锁定」后才开始跟随"
+            log.info("Saved calibration loaded; waiting for explicit operator resume")
 
     def cleanup(self) -> None:
         log.info("Cleaning up hardware...")
@@ -885,7 +1187,16 @@ class Controller:
         msg = str(exc).lower()
         return any(
             tok in msg
-            for tok in ("serial", "i/o error", "input/output", "device disconnected")
+            for tok in (
+                "serial",
+                "i/o error",
+                "input/output",
+                "device disconnected",
+                "clearcommerror",
+                "permissionerror",
+                "access is denied",
+                "拒绝访问",
+            )
         )
 
     def _probe_links(self) -> Optional[str]:
@@ -895,8 +1206,24 @@ class Controller:
         even when the control mode is paused and would not otherwise touch hardware.
         Requires ``_probe_fail_limit`` consecutive failures to avoid one-shot flicker.
         """
-        if self.cfg.mock:
-            return None
+        # On Windows an already-open serial handle can survive unplugging for
+        # a while.  Treat the OS device enumeration as an additional liveness
+        # signal, otherwise a cached handle can leave a removed COM port shown
+        # as "正常" indefinitely.
+        enumerated_ports = {
+            str(info.device).casefold()
+            for info in serial.tools.list_ports.comports()
+            if info.device
+        }
+
+        def _assert_port_present(port: Optional[str], label: str) -> None:
+            if not port:
+                return
+            if os.name == "nt":
+                if str(port).casefold() not in enumerated_ports:
+                    raise OSError(f"{label} USB 串口已移除: {port}")
+            elif not os.path.exists(port):
+                raise OSError(f"{label} port missing: {port}")
 
         def _fail(which: str, err: BaseException) -> Optional[str]:
             self._probe_fail_counts[which] = self._probe_fail_counts.get(which, 0) + 1
@@ -911,10 +1238,14 @@ class Controller:
         if self.master is not None and self.arm_connected("master"):
             try:
                 port = getattr(self.master, "port", None)
-                if port and not os.path.exists(port):
-                    raise OSError(f"leader port missing: {port}")
+                _assert_port_present(port, "主臂")
                 if hasattr(self.master, "check_link"):
                     self.master.check_link()
+                warning = getattr(self.master, "last_warning", None)
+                if warning:
+                    self._set_arm_status("master", "ok", detail=warning)
+                elif self.leader_profile_id == "so101_leader":
+                    self._set_arm_status("master", "ok", detail="已读取 SO-ARM101 主臂位置（待校准）")
                 self._probe_fail_counts["master"] = 0
             except Exception as e:  # noqa: BLE001
                 hit = _fail("master", e)
@@ -925,10 +1256,14 @@ class Controller:
             for slave in list(self.slaves):
                 try:
                     port = getattr(slave, "port", None)
-                    if port and port != "<mock>" and not os.path.exists(port):
-                        raise OSError(f"[{slave.name}] port missing: {port}")
+                    _assert_port_present(port, "从臂")
                     if hasattr(slave, "check_link"):
                         slave.check_link()
+                    warning = getattr(slave, "last_warning", None)
+                    if warning:
+                        self._set_arm_status("slave", "ok", detail=warning)
+                    elif self.follower_profile_id == "so101_follower":
+                        self._set_arm_status("slave", "ok", detail="已读取 SO-ARM101 从臂位置（待校准）")
                     self._probe_fail_counts["slave"] = 0
                 except Exception as e:  # noqa: BLE001
                     hit = _fail("slave", e)
@@ -951,7 +1286,7 @@ class Controller:
             self._arms_were_ready = False
             self._ever_had_link_fault = True
             # Wait for unlock after reconnect (same UX as e-stop).
-            if calibration_ready(self.cal_master_ranges, self.cal_slave_ranges):
+            if self._calibration_ready():
                 self.mode = "paused"
             else:
                 self.mode = "idle"
@@ -961,6 +1296,8 @@ class Controller:
             self._drop_slave(safe=False)
 
     def _resolve_ports(self) -> tuple[Optional[str], Optional[str]]:
+        if self.leader_profile_id == "so101_leader" and self.follower_profile_id == "so101_follower":
+            return detect_so101_ports(self.cfg.master_port, self.cfg.slave_port)
         master_port = self.cfg.master_port
         slave_port = self.cfg.slave_port
         if not master_port or not slave_port:
@@ -971,6 +1308,15 @@ class Controller:
 
     def _open_master(self, port: str) -> None:
         self._drop_master(quiet=True)
+        if self.leader_profile_id == "so101_leader":
+            self.master = SO101Arm(
+                port, name="so101_leader", configure_position_mode=True
+            )
+            self.master.setup()
+            self.master.disable_all()
+            self._set_arm_status("master", "ok", detail="已读取 SO-ARM101 主臂位置（待校准）", port=port)
+            log.info("SO-ARM101 leader initialized on %s (awaiting calibration)", port)
+            return
         self.master = PiPER_MateAgilex(
             fashionstar_port=port,
             gripper_exist=self.cfg.gripper_exist,
@@ -987,6 +1333,16 @@ class Controller:
 
     def _open_slave(self, port: str) -> None:
         self._drop_slave(quiet=True, safe=False)
+        if self.follower_profile_id == "so101_follower":
+            slave = SO101Arm(
+                port, name="so101_follower", configure_position_mode=True
+            )
+            slave.setup()
+            slave.disable_all()
+            self.slaves = [slave]
+            self._set_arm_status("slave", "ok", detail="已读取 SO-ARM101 从臂位置（待校准）", port=port)
+            log.info("SO-ARM101 follower initialized on %s (awaiting calibration)", port)
+            return
         slave = SlaveArm(port, self.cfg.baudrate, "slave_1")
         slave.setup()
         try:
@@ -1002,9 +1358,16 @@ class Controller:
         log.info("Slave arm initialized on %s", port)
 
     def _try_reconnect(self, *, force: bool = False) -> None:
-        """Attempt to (re)open missing/failed arms. Safe to call often."""
-        if self.cfg.mock:
-            return
+        """Serialize all physical reconnect operations.
+
+        In particular, this protects a manual auto-detection request from
+        racing the control thread's background reconnect loop on COM11/COM13.
+        """
+        with self._hardware_reconnect_lock:
+            self._try_reconnect_locked(force=force)
+
+    def _try_reconnect_locked(self, *, force: bool = False) -> None:
+        """Attempt to (re)open missing/failed arms. Caller holds reconnect lock."""
         now = time.monotonic()
         if not force and (now - self._last_reconnect_attempt) < self._reconnect_interval_s:
             return
@@ -1016,6 +1379,38 @@ class Controller:
             return
 
         master_port, slave_port = self._resolve_ports()
+
+        # A Windows USB serial handle can remain unavailable briefly after an
+        # unplug/replug.  Opening COM13 for a temporary all-profile probe and
+        # immediately opening it again for the real SO-ARM101 adapter causes
+        # ClearCommError/PermissionError on many CH343 drivers.  When the
+        # currently selected SO pair is still enumerated, reconnect it
+        # directly; _open_* verifies all six live position registers anyway.
+        # Fall back to a cross-profile feedback scan only when the selected
+        # SO-ARM101 family is no longer present, preserving automatic support
+        # for a different arm type after a hardware swap.
+        selected_so101 = (
+            self.leader_profile_id == "so101_leader"
+            and self.follower_profile_id == "so101_follower"
+        )
+        if not (selected_so101 and (master_port or slave_port)):
+            live_profiles = self._discover_live_profiles()
+            discovered = detect_arm_profiles(live_profiles=live_profiles)
+            if (
+                discovered.status == "ok"
+                and discovered.leader_id
+                and discovered.follower_id
+                and (discovered.leader_id, discovered.follower_id)
+                != (self.leader_profile_id, self.follower_profile_id)
+            ):
+                log.info(
+                    "Auto-detected live pair %s__%s; replacing %s",
+                    discovered.leader_id,
+                    discovered.follower_id,
+                    self.pair_id,
+                )
+                self.set_profiles(discovered.leader_id, discovered.follower_id)
+                master_port, slave_port = self._resolve_ports()
 
         if need_master:
             self._set_arm_status(
@@ -1050,23 +1445,33 @@ class Controller:
                 detail="正在重连…",
                 port=slave_port,
             )
-            if not slave_port:
+            if self.follower_profile_id == "so101_follower":
+                _, detected_follower = detect_so101_ports(self.cfg.master_port, self.cfg.slave_port)
+                slave_candidates = [detected_follower] if detected_follower else []
+            else:
+                slave_candidates = detect_slave_port_candidates(self.cfg.slave_port)
+            if not slave_candidates:
                 self._set_arm_status(
                     "slave",
                     "missing",
-                    detail="未检测到串口（HDSC CDC /dev/rebot-slave）",
+                    detail="未检测到串口（HDSC CDC / CH343）",
                 )
             else:
-                try:
-                    self._open_slave(slave_port)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("Slave reconnect failed: %s", e)
-                    self._drop_slave(quiet=True, safe=False)
+                errors: list[str] = []
+                for candidate in slave_candidates:
+                    try:
+                        self._open_slave(candidate)
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("Slave probe on %s failed: %s", candidate, e)
+                        self._drop_slave(quiet=True, safe=False)
+                        errors.append(f"{candidate}: {e}")
+                else:
                     self._set_arm_status(
                         "slave",
                         "error",
-                        detail=str(e),
-                        port=slave_port,
+                        detail="；".join(errors),
+                        port=slave_candidates[0],
                     )
 
         if self.arms_ready() and not self._arms_were_ready:
@@ -1114,8 +1519,11 @@ class Controller:
             if master_js:
                 self.last_joint_states = deepcopy(master_js)
                 self.last_safety_joint_states = deepcopy(master_js)
+                self._reset_mapping_anchor(master_js)
+            else:
+                self._reset_mapping_anchor(None)
             self._stop_active_locked()
-            if calibration_ready(self.cal_master_ranges, self.cal_slave_ranges):
+            if self._calibration_ready():
                 self.mode = "paused"
                 self._arms_hint = "机械臂已恢复，请点击「解除锁定」进入跟随"
             else:
@@ -1129,13 +1537,30 @@ class Controller:
     def _filter(new_js: dict, last: Optional[dict], alpha: float) -> dict:
         if last is None:
             return deepcopy(new_js)
-        return {k: last[k] + alpha * (new_js[k] - last[k]) for k in new_js}
+        out: dict = {}
+        for k, value in new_js.items():
+            prev = last.get(k)
+            if not isinstance(value, (int, float)) or not isinstance(prev, (int, float)):
+                continue
+            if Controller._is_circular_joint(k):
+                out[k] = Controller._circular_lerp(float(prev), float(value), alpha)
+            else:
+                out[k] = float(prev) + alpha * (float(value) - float(prev))
+        return out
 
     @staticmethod
     def _changed_enough(a: Optional[dict], b: Optional[dict], threshold: float) -> bool:
         if a is None or b is None:
             return True
-        return any(abs(a[k] - b[k]) > threshold for k in a)
+        for k in a:
+            if not isinstance(a.get(k), (int, float)) or not isinstance(b.get(k), (int, float)):
+                continue
+            av = float(a[k])
+            bv = float(b[k])
+            delta = Controller._angular_delta(av, bv) if Controller._is_circular_joint(k) else bv - av
+            if abs(delta) > threshold:
+                return True
+        return False
 
     @staticmethod
     def _interpolate(frame_a: dict, frame_b: dict, t_now: float) -> dict:
@@ -1145,7 +1570,17 @@ class Controller:
             return deepcopy(js0)
         a = max(0.0, min(1.0, (t_now - t0) / (t1 - t0)))
         a = a * a * (3 - 2 * a)
-        return {k: js0[k] + a * (js1[k] - js0[k]) for k in js0}
+        out: dict = {}
+        for k in js0:
+            v0 = js0.get(k)
+            v1 = js1.get(k)
+            if not isinstance(v0, (int, float)) or not isinstance(v1, (int, float)):
+                continue
+            if Controller._is_circular_joint(k):
+                out[k] = Controller._circular_lerp(float(v0), float(v1), a)
+            else:
+                out[k] = float(v0) + a * (float(v1) - float(v0))
+        return out
 
     @staticmethod
     def _blend(js_from: dict, js_to: dict, alpha: float) -> dict:
@@ -1157,7 +1592,10 @@ class Controller:
             v0 = js_from.get(k, js_to.get(k))
             v1 = js_to.get(k, js_from.get(k))
             if isinstance(v0, (int, float)) and isinstance(v1, (int, float)):
-                out[k] = float(v0) + a * (float(v1) - float(v0))
+                if Controller._is_circular_joint(k):
+                    out[k] = Controller._circular_lerp(float(v0), float(v1), a)
+                else:
+                    out[k] = float(v0) + a * (float(v1) - float(v0))
         return out
 
     def _current_output_js(self) -> Optional[dict]:
@@ -1217,7 +1655,12 @@ class Controller:
         for k, v in js.items():
             if k == "gripper" or k not in last:
                 continue
-            if abs(v - last[k]) > spike:
+            d = (
+                abs(self._angular_delta(last[k], v))
+                if self._is_circular_joint(k)
+                else abs(float(v) - float(last[k]))
+            )
+            if d > spike:
                 log.warning("Safety: spike on %s (Δ=%.3f rad), pausing", k, v - last[k])
                 return None
         max_step = self.cfg.max_joint_vel_rad_s * dt
@@ -1226,7 +1669,11 @@ class Controller:
             if k == "gripper" or k not in last:
                 out[k] = v
                 continue
-            delta = v - last[k]
+            delta = (
+                self._angular_delta(last[k], v)
+                if self._is_circular_joint(k)
+                else v - last[k]
+            )
             if delta > max_step:
                 out[k] = last[k] + max_step
             elif delta < -max_step:
@@ -1242,6 +1689,7 @@ class Controller:
             return
         self.last_joint_states = deepcopy(master_js)
         self.last_safety_joint_states = deepcopy(master_js)
+        self._reset_mapping_anchor(master_js)
         # last_output stays in slave/command space (mapped when calibration is on).
         self.last_output_joint_states = deepcopy(self._map_for_slave(master_js))
 
@@ -1334,7 +1782,7 @@ class Controller:
         with self.lock:
             self._stop_active_locked()
             self._calibrating = False
-            if not calibration_ready(self.cal_master_ranges, self.cal_slave_ranges):
+            if not self._calibration_ready():
                 self.mode = "idle"
                 log.info("Forced idle (no valid calibration — teleop blocked)")
                 return
@@ -1355,6 +1803,7 @@ class Controller:
             if self.mode not in ("follow", "paused", "idle", "free_move"):
                 raise ControllerError(f"Cannot start calibration from mode={self.mode}")
             self._stop_active_locked()
+            self._reset_mapping_anchor(None)
             # Stop teleop commands BEFORE touching serial for free-move.
             self._calibrating = True
             self.mode = "calibrate"
@@ -1394,7 +1843,7 @@ class Controller:
         with self.lock:
             if self.mode != "calibrate":
                 raise ControllerError("Not currently calibrating")
-            if not calibration_ready(self.cal_master_ranges, self.cal_slave_ranges):
+            if not self._calibration_ready():
                 raise ControllerError(
                     "校准范围不足：请把主臂、从臂每个关节都转到机械极限后再完成"
                 )
@@ -1421,6 +1870,7 @@ class Controller:
                 active=False,
                 saved_at=saved_at,
                 mapping_enabled=True,
+                joint_keys=self._active_joint_keys(),
             )
             log.info("Calibration finished (saved_at=%s, mapping ON)", saved_at)
 
@@ -1462,7 +1912,7 @@ class Controller:
     def _calibration_mapping_enabled(self) -> bool:
         return (
             not self._calibrating
-            and calibration_ready(self.cal_master_ranges, self.cal_slave_ranges)
+            and self._calibration_ready()
         )
 
     def set_motor_map(self, mapping: dict) -> dict:
@@ -1506,7 +1956,10 @@ class Controller:
         for k in keys:
             av, bv = a.get(k), b.get(k)
             if isinstance(av, (int, float)) and isinstance(bv, (int, float)):
-                best = max(best, abs(float(av) - float(bv)))
+                delta = Controller._angular_delta(float(av), float(bv))
+                if not Controller._is_circular_joint(k):
+                    delta = float(bv) - float(av)
+                best = max(best, abs(delta))
         return best
 
     def _apply_mmap_blend(self, target: dict) -> dict:
@@ -1529,7 +1982,10 @@ class Controller:
             a = from_js.get(k, target.get(k))
             b = target.get(k, from_js.get(k))
             if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-                out[k] = float(a) + alpha * (float(b) - float(a))
+                if self._is_circular_joint(k):
+                    out[k] = self._circular_lerp(float(a), float(b), alpha)
+                else:
+                    out[k] = float(a) + alpha * (float(b) - float(a))
         return out
 
     def _clear_mmap_blend(self) -> None:
@@ -1544,8 +2000,9 @@ class Controller:
         hold = self.last_output_joint_states or self.last_measured_joint_states or {}
         mapping = self.motor_map or default_motor_map()
         if self._calibration_mapping_enabled():
+            aligned_master = self._align_master_for_mapping(master_js)
             routed = route_range_map(
-                master_js,
+                aligned_master,
                 self.cal_master_ranges,
                 self.cal_slave_ranges,
                 mapping,
@@ -1630,12 +2087,12 @@ class Controller:
             raise ControllerError("机械臂未就绪，请等待串口恢复后再解锁")
         with self.lock:
             if self.mode == "idle":
-                if not calibration_ready(self.cal_master_ranges, self.cal_slave_ranges):
+                if not self._calibration_ready():
                     raise ControllerError("需要先完成校准才能跟随")
                 from_idle = True
                 from_free_move = False
             elif self.mode in ("paused", "free_move"):
-                if not calibration_ready(self.cal_master_ranges, self.cal_slave_ranges):
+                if not self._calibration_ready():
                     self.mode = "idle"
                     log.info("Resume blocked — no valid calibration")
                     return
@@ -1673,7 +2130,15 @@ class Controller:
             try:
                 # enable_all clears free-move flags and retries POS_VEL switch —
                 # preferred after free_move (J1 was force-disabled there).
-                if from_free_move and hasattr(slave, "enable_all"):
+                if (
+                    isinstance(slave, SO101Arm)
+                    and hasattr(slave, "enable_all")
+                ):
+                    # SO-ARM101 uses raw STS3215 torque control.  Its
+                    # recover() is deliberately read-only, so resume is the
+                    # only explicit path that enables the follower.
+                    slave.enable_all()
+                elif from_free_move and hasattr(slave, "enable_all"):
                     slave.enable_all()
                 elif hasattr(slave, "recover"):
                     slave.recover()
@@ -1851,7 +2316,16 @@ class Controller:
                     return False    # user aborted
             a = step / steps
             a = a * a * (3 - 2 * a)
-            js = {k: from_js[k] + a * (to_js[k] - from_js[k]) for k in from_js}
+            js = {}
+            for k in from_js:
+                fv = from_js.get(k)
+                tv = to_js.get(k)
+                if not isinstance(fv, (int, float)) or not isinstance(tv, (int, float)):
+                    continue
+                if self._is_circular_joint(k):
+                    js[k] = self._circular_lerp(float(fv), float(tv), a)
+                else:
+                    js[k] = float(fv) + a * (float(tv) - float(fv))
             for slave in self.slaves:
                 try:
                     slave.send_joint_states(js)
@@ -2082,6 +2556,7 @@ class Controller:
                     active=self.mode == "calibrate",
                     saved_at=self.cal_saved_at,
                     mapping_enabled=self._calibration_mapping_enabled(),
+                    joint_keys=self._active_joint_keys(),
                 ),
                 "motor_map": {
                     k: self.motor_map.get(k) for k in MOTOR_MAP_KEYS
@@ -2114,7 +2589,13 @@ class Controller:
                 try:
                     # Active probe even when paused (USB/power loss otherwise silent).
                     now = time.monotonic()
-                    if self.arms_ready() and (now - last_probe) >= probe_interval:
+                    # Probe each healthy side independently.  Waiting for
+                    # both arms to be healthy leaves the other side's stale
+                    # success state frozen after one USB cable is removed.
+                    if (
+                        (self.arm_connected("master") or self.arm_connected("slave"))
+                        and (now - last_probe) >= probe_interval
+                    ):
                         last_probe = now
                         if self._probe_links() is not None:
                             continue

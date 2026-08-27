@@ -142,6 +142,12 @@ function AppInner() {
             )}
           </div>
         )}
+        <aside className="setup-panel">
+          <ArmSelectPanel
+            snapshot={snapshot}
+            onToast={(kind, msg) => toast.push(kind, msg)}
+          />
+        </aside>
         <JointPanel
           joints={
             mode === "calibrate" || mode === "free_move"
@@ -150,6 +156,9 @@ function AppInner() {
           }
           slaveJoints={snapshot?.slave_joint_states}
           mode={mode}
+          isSo101={snapshot?.leader_profile === "so101_leader" && snapshot?.follower_profile === "so101_follower"}
+          leaderPort={snapshot?.arms?.master.port}
+          followerPort={snapshot?.arms?.slave.port}
           masterLabel={mode === "calibrate" || mode === "free_move"}
           motorMap={snapshot?.motor_map}
           motorMapBlending={snapshot?.motor_map_blending}
@@ -159,16 +168,10 @@ function AppInner() {
           }
           onMotorMapError={(msg) => toast.push("err", `电机映射失败：${msg}`)}
         />
-        <div className="mid-stack">
-          <ArmSelectPanel
-            snapshot={snapshot}
-            onToast={(kind, msg) => toast.push(kind, msg)}
-          />
-          <CalibratePanel
-            snapshot={snapshot}
-            onToast={(kind, msg) => toast.push(kind, msg)}
-          />
-        </div>
+        <CalibratePanel
+          snapshot={snapshot}
+          onToast={(kind, msg) => toast.push(kind, msg)}
+        />
         <main className="main-stage">
           {snapshot ? (
             <StageMain
